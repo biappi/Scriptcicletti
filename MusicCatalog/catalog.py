@@ -17,8 +17,16 @@ from mutagen.trueaudio import TrueAudio
 from mutagen.wavpack import WavPack
 from collections import defaultdict
 import re
+from getopt import getopt
 
-from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE
+try:
+   from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE
+except:
+   pass
+
+from SocketServer import ThreadingTCPServer
+from SimpleHTTPServer import SimpleHTTPRequestHandler
+from StringIO import StringIO
 
 DBSCHEMA = ( """
 PRAGMA foreign_keys = ON;
@@ -83,6 +91,7 @@ class SubtreeListener(ProcessEvent):
    
    def __init__(self, db):
       self.db = db
+      self.recents = []
       self.recentartists = {}
       self.recentalbums = {}
       self.recentgenres = {}
@@ -99,13 +108,18 @@ class SubtreeListener(ProcessEvent):
       process_event(evt)
 
    def process_IN_DELETE(self):
-      pass
+      abspathitem = "%s/%s" % (evt.path, evt.name)
+      self.db.execute("delete from song where path = ?", abspathitem.decode(FS_ENCODING))
+      if abspathitem in self.recents:
+         self.recents.remove(abspathitem)
 
    def process_event(self, evt):
       abspathitem = "%s/%s" % (evt.path, evt.name)
       if os.isdir(abspathitem):
-         start_scan(abspathitem)
+         start_scan(abspathitem, self.db, True)
       else:
+         if abspathitem in self.recents:
+            return
          id3item = None
          for decoder in DECODERS:
             try:
@@ -121,23 +135,27 @@ class SubtreeListener(ProcessEvent):
          album = " ".join(id3item['TALB'].text).strip().lower()
          albumclean = re.sub("[^\w]*", "", album)
          genre = " ".join(id3item['TCON'].text).strip().lower()
- 
+
          if not artist in self.recentartists.keys():
-            if not db.execute("select id from artist where name = ?", (artist,)).fetchone():
-               db.execute("insert into artist(name) values(?)", (artist,))
-            self.recentartists[artist] = db.execute("select id from artist where name = ?", (artist,)).fetchone()[0]
+            if not self.db.execute("select id from artist where name = ?", (artist,)).fetchone():
+               self.db.execute("insert into artist(name) values(?)", (artist,))
+            self.recentartists[artist] = self.db.execute("select id from artist where name = ?", (artist,)).fetchone()[0]
  
          if not album in self.recentalbums.keys():
-            if not db.execute("select id from album where titleclean = ?", (album,)).fetchone():
-               db.execute("insert into album(title, titleclean) values(?, ?)", (album, albumclean))
-            self.recentalbums[album] = db.execute("select id from album where titleclean = ?", (albumclean,)).fetchone()[0]
+            if not self.db.execute("select id from album where titleclean = ?", (album,)).fetchone():
+               self.db.execute("insert into album(title, titleclean) values(?, ?)", (album, albumclean))
+            self.recentalbums[album] = self.db.execute("select id from album where titleclean = ?", (albumclean,)).fetchone()[0]
  
          if not genre in self.recentgenres.keys():
-            if not db.execute("select id from genre where desc = ?", (genre,)).fetchone():
-               db.execute("insert into genre(desc) values(?)", (genre,))
-            self.recentgenres[genre] = db.execute("select id from genre where desc = ?", (genre,)).fetchone()[0]
+            if not self.db.execute("select id from genre where desc = ?", (genre,)).fetchone():
+               self.db.execute("insert into genre(desc) values(?)", (genre,))
+            self.recentgenres[genre] = self.db.execute("select id from genre where desc = ?", (genre,)).fetchone()[0]
          
-         db.execute("insert into song(title, titleclean, artist_id, genre_id, album_id, path) values (?,?,?,?,?,?)", (title, titleclean, self.recentartists[artist], self.recentgenres[genre], self.recentalbums[album], abspathitem.decode(FS_ENCODING)))
+         self.db.execute("insert into song(title, titleclean, artist_id, genre_id, album_id, path) values (?,?,?,?,?,?)", (title, titleclean, self.recentartists[artist], self.recentgenres[genre], self.recentalbums[album], abspathitem.decode(FS_ENCODING)))
+
+         if len(self.recents) >= 20:
+            self.recents.pop(0)
+         self.recents.append(abspathitem)
 
          if len(self.recentalbums) > 20:
             self.recentalbums.clear()
@@ -147,6 +165,56 @@ class SubtreeListener(ProcessEvent):
             self.recentsongs.clear()
          if len(self.recentartists) > 20:
             self.recentartists.clear()
+
+
+
+class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
+
+   #TODO: return html/m3u files instead of queries
+
+   def do_GET(self):
+      text = self.path_to_query()
+      if (text):
+         mem = StringIO(text)
+         self.send_response(200)
+         self.end_headers()
+         self.copyfile(mem, self.wfile)
+      else:
+         self.send_response(500)
+         self.end_headers()
+
+   def path_to_query(self):
+      """ query:
+         /browse/ -- browse catalog like a listdir
+         /search/ -- do a free text research
+         /smart/ -- perform a smart playlist
+      """
+
+      items = self.path.split("/")
+      if len(items) < 2 or items == ['', '']:
+         return None
+
+      items = items[1:]
+      if not items[-1]:
+         items = items[:-1]
+
+      if items[0] == "browse":
+         where = []
+         args = ()
+         if len(items) % 2 == 0:
+            query = "select * from %s;" % items[-1]
+         else:
+            for i in range(1, len(items), 2):
+               where.append("%s = ?" % items[i])
+               args = args + (items[i+1],)
+
+            query = "select s.* from song s left join genre g on (s.id = g.id) left join artist a on (a.id = ) %s;" % (where and "where %s" % " and ".join(where) or "")
+      elif items[0] == "search":
+         pass
+      elif items[0] == "smart":
+         pass
+
+      return query
 
 
 def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
@@ -191,6 +259,8 @@ def start_daemon(path, db):
    notifier_sb.start()
 
    wdd_sb = wm_auto.add_watch(path, subdirmask, rec=True)
+
+   ThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler).serve_forever()
    
 
 def start_scan(path, db, depth = 1):
@@ -277,44 +347,47 @@ usage: %s [-h|--help] [-s|--scan] [-d|--daemonize] [-n|--no-recursive] path\n
 """ % argv)
    sys.exit(1)
 
+def perror(reason):
+   print("error %s\ntry -h option for usage" % reason)
+
 if __name__ == "__main__":
 
-   args = []
-   args.extend(sys.argv[1:])
+   opts, args = getopt(sys.argv[1:], "hsdn", ["help", "scan", "daemonize", "no-recursive"])
 
-   if not args or "--help" in args or "-h" in args:
+   if not opts or not args:
       print_usage(sys.argv[0])
-
-   patharg = args.pop()
-
-   for i in args:
-      if not i.strip('-') in ["s", "scan", "d", "daemonize", "n", "no-recursive"]:
-         print("error: %s not a valid option" % i)
-         sys.exit(0)
-
-   if not os.path.isdir(patharg):
-      print("error: %s not a valid directory" % patharg)
-      sys.exit(0)
+   elif len(args) > 1:
+      perror("too much directories")
+      sys.exit(1)
    else:
-      if patharg[-1:] == "/":
-         patharg = patharg[:-1]
+      recursive = True
+      for opt in opts:
+         if opt in ("-s", "--help"):
+            print_usage(sys.argv[0])
+         elif opt in ("-s", "--scan"):
+            scan = True
+         elif opt in ("-h", "--daemonize"):
+            daemon = True
+         elif opt in ("-n", "--no-recursive"):
+            recursive = False
+         else:
+            perror("reading from command line: %s" % sys.argv[0])
+            sys.exit(1)
+      for arg in args:
+         if not os.path.isdir(arg):
+            perror("%s is not a valid directory." % arg)
+            sys.exit(1)
+         elif arg[-1:] == "/":
+            patharg = arg[:-1]
+            break
+
       dbpath = "%s/.%s.sqlite" % (patharg, os.path.basename(patharg))
-
-   db = None
-   prepare = not os.path.exists(dbpath)
-   depth = not "--no-recursive" in args and not "-n" in args
-
-   if "--scan" in args or "-s" in args:
+      prepare = not os.path.exists(dbpath)
       db = dbapi.connect(dbpath)
       if prepare:
          for sql in DBSCHEMA:
             db.execute(sql)
-      start_scan(patharg, db, depth)
-
-   if len(args) == 1 or "--daemonize" in args or "-d" in args:
-      if not db:
-         db = dbapi.connect(dbpath)
-         if prepare:
-            for sql in DBSCHEMA:
-               db.execute(sql)
-      start_daemon(patharg, db)
+      if scan:
+         start_scan(patharg, db, recursive)
+      if daemon:
+         start_daemon(patharg, db)
