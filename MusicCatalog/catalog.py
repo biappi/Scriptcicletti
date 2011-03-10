@@ -169,30 +169,48 @@ class SubtreeListener(ProcessEvent):
 
 
 class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
+   """
+         a HTTPRequestHandler that perform queries on db
+         the main idea is a conversion from URI to SQL:
 
-   #TODO: return html/m3u files instead of queries
+         GET /<action>/[<subaction>[/<parameter>] ... ] => "SELECT FROM [joined tables] WHERE [clause from parameters]"
+   """
 
    def do_GET(self):
-      text = self.path_to_query()
-      if (text):
-         mem = StringIO(text)
+      query, args = self.path_to_query()
+      if (query):
+         try:
+            if args:
+               results = self.db.execute(query, args).fetchall()
+            else:
+               results = curself.db.execute(query).fetchall()
+         except:
+            self.send_response(404)
+            self.end_headers()
+
+         data = StringIO()
+         for i in results:
+            data.write(i)
+         data.seek(0)
+
          self.send_response(200)
          self.end_headers()
-         self.copyfile(mem, self.wfile)
+         self.copyfile(data, self.wfile)
       else:
          self.send_response(500)
          self.end_headers()
 
    def path_to_query(self):
       """ query:
-         /browse/ -- browse catalog like a listdir
-         /search/ -- do a free text research
-         /smart/ -- perform a smart playlist
+         /browse/ -- browse catalog like a listdir (e.g. /browse/genre/indie /browse/year/1979 /browse/genre/indie/year/1980)
+         /search/ -- do a free text research (e.g. /search/blitzrieg%20bop)
+         /smart/ -- perform a smart playlist (e.g. /smart/shine%20on%20you)
+         /aggregate/ -- create a playlist based on a criteria (e.g. /aggregate/genre/indie,electro,indie-pop)
       """
 
       items = self.path.split("/")
       if len(items) < 2 or items == ['', '']:
-         return None
+         return None, None
 
       items = items[1:]
       if not items[-1]:
@@ -213,8 +231,18 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
          pass
       elif items[0] == "smart":
          pass
+      elif items[0] == "aggregate":
+         pass
 
-      return query
+      return query, args
+
+
+class CatalogThreadingTCPServer(ThreadingTCPServer):
+   """a threaded tcp server interfaced with a database"""
+
+   def __init__(self, server_address, RequestHandlerClass, database, bind_and_activate=True):
+      TCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate=True)
+      self.db = database
 
 
 def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
@@ -260,7 +288,7 @@ def start_daemon(path, db):
 
    wdd_sb = wm_auto.add_watch(path, subdirmask, rec=True)
 
-   ThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler).serve_forever()
+   CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler).serve_forever()
    
 
 def start_scan(path, db, depth = 1):
