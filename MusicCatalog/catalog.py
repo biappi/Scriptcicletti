@@ -17,7 +17,7 @@ from mutagen.trueaudio import TrueAudio
 from mutagen.wavpack import WavPack
 from collections import defaultdict
 import re
-from getopt import getopt
+from getopt import getopt, gnu_getopt
 
 try:
    from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE
@@ -89,8 +89,8 @@ FS_ENCODING = sys.getfilesystemencoding()
 
 class SubtreeListener(ProcessEvent):
    
-   def __init__(self, db):
-      self.db = db
+   def __init__(self, dbpath):
+      self.db = dbapi.connect(dbpath)
       self.recents = []
       self.recentartists = {}
       self.recentalbums = {}
@@ -99,23 +99,25 @@ class SubtreeListener(ProcessEvent):
       ProcessEvent.__init__(self)
 
    def process_IN_CREATE(self, evt):
-      process_event(evt)
+      self.process_event(evt)
 
    def process_IN_MOVED_TO(self, evt):
-      process_event(evt)
+      self.process_event(evt)
 
-   def process_IN_CLOSE_WRITE(self):
-      process_event(evt)
+   def process_IN_CLOSE_WRITE(self, evt):
+      self.process_event(evt)
 
-   def process_IN_DELETE(self):
+   def process_IN_DELETE(self, evt):
       abspathitem = "%s/%s" % (evt.path, evt.name)
+      if abspathitem == dbpath:
+         return
       self.db.execute("delete from song where path = ?", abspathitem.decode(FS_ENCODING))
       if abspathitem in self.recents:
          self.recents.remove(abspathitem)
 
    def process_event(self, evt):
       abspathitem = "%s/%s" % (evt.path, evt.name)
-      if os.isdir(abspathitem):
+      if os.path.isdir(abspathitem):
          start_scan(abspathitem, self.db, True)
       else:
          if abspathitem in self.recents:
@@ -167,26 +169,28 @@ class SubtreeListener(ProcessEvent):
             self.recentartists.clear()
 
 
-
 class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
    """
          a HTTPRequestHandler that perform queries on db
          the main idea is a conversion from URI to SQL:
 
-         GET /<action>/[<subaction>[/<parameter>] ... ] => "SELECT FROM [joined tables] WHERE [clause from parameters]"
+         GET /<action>/[<subclause>[/<parameter>] ... ] => "SELECT FROM [joined tables] WHERE [clause from parameters]"
    """
 
    def do_GET(self):
+      db = dbapi.connect(self.server.dbpath)
       query, args = self.path_to_query()
       if (query):
-         try:
-            if args:
-               results = self.db.execute(query, args).fetchall()
-            else:
-               results = curself.db.execute(query).fetchall()
-         except:
-            self.send_response(404)
-            self.end_headers()
+         results = []
+         #try:
+         if args:
+            results = db.execute(query, args).fetchall()
+         else:
+            results = db.execute(query).fetchall()
+         #except:
+         #   self.send_response(404)
+         #   self.end_headers()
+         #   return
 
          data = StringIO()
          for i in results:
@@ -226,23 +230,35 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
                where.append("%s = ?" % items[i])
                args = args + (items[i+1],)
 
-            query = "select s.* from song s left join genre g on (s.id = g.id) left join artist a on (a.id = ) %s;" % (where and "where %s" % " and ".join(where) or "")
+            query = "select distinct s.* from song s left join genre g on (s.id = g.id) left join artist a on (a.id = s.id) %s order by s.title;" % (where and "where %s" % " and ".join(where) or "")
+
       elif items[0] == "search":
-         pass
+            query = "select distinct s.*, g.desc as genre from song s left join genre g on (s.genre_id = g.id) left join artist a on (s.artist_id = a.id) where g.desc like ? or a.name like ? or s.title like ? order by s.title;"
+            args = tuple( '%%%s%%' % " ".join(items[1:]) for i in (1,2,3) ) #  --> ('%%%s%%' % ... , '%%%s%%' % ... , '%%%s%%' % ... ) 
       elif items[0] == "smart":
          pass
       elif items[0] == "aggregate":
+         
          pass
 
       return query, args
 
 
+
 class CatalogThreadingTCPServer(ThreadingTCPServer):
    """a threaded tcp server interfaced with a database"""
 
-   def __init__(self, server_address, RequestHandlerClass, database, bind_and_activate=True):
-      TCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate=True)
-      self.db = database
+   def __init__(self, server_address, RequestHandlerClass, dbpath, bind_and_activate=True):
+      ThreadingTCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate=True)
+      self.dbpath = dbpath
+
+#   def process_request(self, request, client_address):
+#      """Start a new thread to process the request."""
+#      t = threading.Thread(target = self.process_request_thread,
+#                           args = (request, client_address, self.dbpath))
+#      if self.daemon_threads:
+#          t.setDaemon (1)
+#      t.start()
 
 
 def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
@@ -277,18 +293,18 @@ def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
    os.dup2(se.fileno(), sys.stderr.fileno())
 
 
-def start_daemon(path, db):
+def start_daemon(path, dbpath):
    """ installs a subtree listener and wait for events """
-   daemonize()
+   #daemonize()
 
    wm_auto = WatchManager()
    subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_TO | IN_CREATE
-   notifier_sb = ThreadedNotifier(wm_auto, SubtreeListener(db))
+   notifier_sb = ThreadedNotifier(wm_auto, SubtreeListener(dbpath))
    notifier_sb.start()
 
-   wdd_sb = wm_auto.add_watch(path, subdirmask, rec=True)
+   wdd_sb = wm_auto.add_watch(path, subtreemask, rec=True)
 
-   CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler).serve_forever()
+   CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler, dbpath).serve_forever()
    
 
 def start_scan(path, db, depth = 1):
@@ -389,17 +405,19 @@ if __name__ == "__main__":
       sys.exit(1)
    else:
       recursive = True
+      scan = False
+      daemon = False
       for opt in opts:
-         if opt in ("-s", "--help"):
+         if opt[0] in ("-h", "--help"):
             print_usage(sys.argv[0])
-         elif opt in ("-s", "--scan"):
+         elif opt[0] in ("-s", "--scan"):
             scan = True
-         elif opt in ("-h", "--daemonize"):
+         elif opt[0] in ("-d", "--daemonize"):
             daemon = True
-         elif opt in ("-n", "--no-recursive"):
+         elif opt[0] in ("-n", "--no-recursive"):
             recursive = False
          else:
-            perror("reading from command line: %s" % sys.argv[0])
+            perror("reading from command line: %s" % opt[0])
             sys.exit(1)
       for arg in args:
          if not os.path.isdir(arg):
@@ -418,4 +436,4 @@ if __name__ == "__main__":
       if scan:
          start_scan(patharg, db, recursive)
       if daemon:
-         start_daemon(patharg, db)
+         start_daemon(patharg, dbpath)
