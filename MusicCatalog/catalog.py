@@ -18,6 +18,10 @@ from mutagen.wavpack import WavPack
 from collections import defaultdict
 import re
 from getopt import getopt, gnu_getopt
+import pylast
+import threading
+from Queue import Queue
+import subprocess
 
 try:
    from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE
@@ -89,13 +93,14 @@ FS_ENCODING = sys.getfilesystemencoding()
 
 class SubtreeListener(ProcessEvent):
    
-   def __init__(self, dbpath):
+   def __init__(self, dbpath, queue):
       self.db = dbapi.connect(dbpath)
       self.recents = []
       self.recentartists = {}
       self.recentalbums = {}
       self.recentgenres = {}
       self.recentsong = {}
+      self.queue = queue
       ProcessEvent.__init__(self)
 
    def process_IN_CREATE(self, evt):
@@ -118,7 +123,7 @@ class SubtreeListener(ProcessEvent):
    def process_event(self, evt):
       abspathitem = "%s/%s" % (evt.path, evt.name)
       if os.path.isdir(abspathitem):
-         start_scan(abspathitem, self.db, True)
+         start_scan(abspathitem, self.db, self.queue, True)
       else:
          if abspathitem in self.recents:
             return
@@ -154,6 +159,7 @@ class SubtreeListener(ProcessEvent):
             self.recentgenres[genre] = self.db.execute("select id from genre where desc = ?", (genre,)).fetchone()[0]
          
          self.db.execute("insert into song(title, titleclean, artist_id, genre_id, album_id, path) values (?,?,?,?,?,?)", (title, titleclean, self.recentartists[artist], self.recentgenres[genre], self.recentalbums[album], abspathitem.decode(FS_ENCODING)))
+         self.queue.put((abspathitem, title, artist))
 
          if len(self.recents) >= 20:
             self.recents.pop(0)
@@ -168,6 +174,33 @@ class SubtreeListener(ProcessEvent):
          if len(self.recentartists) > 20:
             self.recentartists.clear()
 
+
+class MetadataThread(threading.Thread):
+
+   def __init__(self, queue, dbpath):
+      threading.Thread.__init__(self)
+      self.queue = queue
+      self.dbpath = dbpath
+
+   def run(self):
+   
+      self.db = dbapi.connect(self.dbpath)
+      while True:
+         path, title, artist = self.queue.get()
+         sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", "30"]) # well done, dear sox friend. Well done.
+         sox_process.wait()
+         bpm_process = subprocess.Popen(["/usr/bin/soundstretch", "/tmp/.stretch.wav", "-bpm", "-quick", "-naa"], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+         bpm_process.wait()
+         bpm_output = bpm_process.communicate()
+
+         bpm_pattern = re.search ("Detected BPM rate ([0-9]+)", bpm_output[0], re.M)
+         if bpm_pattern:
+            bpm = float(bpm_pattern.groups()[0])
+         else:
+            bpm = 0.0
+
+         self.db.execute("update song set bpm = ? where path = ?", (bpm, path.decode(FS_ENCODING)))
+         self.db.commit()
 
 class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
    """
@@ -195,6 +228,7 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
          data = StringIO()
          for i in results:
             data.write(i)
+            data.write("\n")
          data.seek(0)
 
          self.send_response(200)
@@ -220,6 +254,8 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
       if not items[-1]:
          items = items[:-1]
 
+      songquery = "select distinct s.id, s.title, g.desc as genre, a.name, al.title from song s left join genre g on (s.genre_id = g.id) left join artist a on (s.artist_id = s.id) left join album al on (s.album_id = al.id)"
+
       if items[0] == "browse":
          where = []
          args = ()
@@ -230,10 +266,10 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
                where.append("%s = ?" % items[i])
                args = args + (items[i+1],)
 
-            query = "select distinct s.* from song s left join genre g on (s.id = g.id) left join artist a on (a.id = s.id) %s order by s.title;" % (where and "where %s" % " and ".join(where) or "")
+            query = "%s %s order by s.title;" % (songquery, (where and "where %s" % " and ".join(where) or ""))
 
       elif items[0] == "search":
-            query = "select distinct s.*, g.desc as genre from song s left join genre g on (s.genre_id = g.id) left join artist a on (s.artist_id = a.id) where g.desc like ? or a.name like ? or s.title like ? order by s.title;"
+            query = "%s where g.desc like ? or a.name like ? or s.title like ? order by s.title;" % songquery
             args = tuple( '%%%s%%' % " ".join(items[1:]) for i in (1,2,3) ) #  --> ('%%%s%%' % ... , '%%%s%%' % ... , '%%%s%%' % ... ) 
       elif items[0] == "smart":
          pass
@@ -293,13 +329,13 @@ def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
    os.dup2(se.fileno(), sys.stderr.fileno())
 
 
-def start_daemon(path, dbpath):
+def start_daemon(path, dbpath, queue):
    """ installs a subtree listener and wait for events """
    #daemonize()
 
    wm_auto = WatchManager()
    subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_TO | IN_CREATE
-   notifier_sb = ThreadedNotifier(wm_auto, SubtreeListener(dbpath))
+   notifier_sb = ThreadedNotifier(wm_auto, SubtreeListener(dbpath, queue))
    notifier_sb.start()
 
    wdd_sb = wm_auto.add_watch(path, subtreemask, rec=True)
@@ -307,7 +343,7 @@ def start_daemon(path, dbpath):
    CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler, dbpath).serve_forever()
    
 
-def start_scan(path, db, depth = 1):
+def start_scan(path, db, queue, depth = 1):
    """ Breadth scan a subtree """
 
    scanpath = [path,]
@@ -356,6 +392,7 @@ def start_scan(path, db, depth = 1):
                recentgenres[genre] = db.execute("select id from genre where desc = ?", (genre,)).fetchone()[0]
             
             db.execute("insert into song(title, titleclean, artist_id, genre_id, album_id, path) values (?,?,?,?,?,?)", (title, titleclean, recentartists[artist], recentgenres[genre], recentalbums[album], abspathitem.decode(FS_ENCODING)))
+            queue.put((abspathitem, title, artist))
       db.commit()
 
 
@@ -430,10 +467,12 @@ if __name__ == "__main__":
       dbpath = "%s/.%s.sqlite" % (patharg, os.path.basename(patharg))
       prepare = not os.path.exists(dbpath)
       db = dbapi.connect(dbpath)
+      queue = Queue()
+      MetadataThread(queue, dbpath).start()
       if prepare:
          for sql in DBSCHEMA:
             db.execute(sql)
       if scan:
-         start_scan(patharg, db, recursive)
+         start_scan(patharg, db, queue, recursive)
       if daemon:
-         start_daemon(patharg, dbpath)
+         start_daemon(patharg, dbpath, queue)
