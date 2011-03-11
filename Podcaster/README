@@ -1,0 +1,21 @@
+Podcaster
+
+Generate a podcast automatically removing marked tracks
+
+Requires: python sox shntools neroAACEncoder (or similar)
+
+Usage: ./podcaster.py [-s] [-v] inputfile markerlist output
+
+   inputfile   is a flac source at maximum 44100Hz rate (shntools doesn't support highest rate :( )
+
+   markerlist  is a logfile generate by a broadcaster program that permits events recording like microphone
+               switch on/off. For example, IDJC permit to set a shell command on particular events:
+
+               et_micon=/bin/echo [ $( date ) ] - mic_up >> /home/radiocicletta/talk.log
+               et_auxon=/bin/echo [ $( date ) ] - aux_up >> /home/radiocicletta/talk.log
+               et_micoff=/bin/echo [ $( date ) ] - mic_down >> /home/radiocicletta/talk.log
+               et_appexit=/bin/echo [ $( date ) ] - idjc_stop >> /home/radiocicletta/talk.log
+
+               the mic_up and mic_down events are mainly used for the script
+
+   output      is the directory where the mp4 file will be stored
