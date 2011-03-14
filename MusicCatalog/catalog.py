@@ -22,9 +22,11 @@ import pylast
 import threading
 from Queue import Queue
 import subprocess
+from itertools import permutations
+from parameters import *
 
 try:
-   from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE
+   from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE, IN_ISDIR, IN_MOVED_FROM
 except:
    pass
 
@@ -53,7 +55,7 @@ PRAGMA foreign_keys = ON;
    trackno integer,
    puid text,
    bpm real,
-   path text not null
+   path text unique not null
 );""",
 """create index songgenre on song(genre_id);
 """,
@@ -63,11 +65,13 @@ PRAGMA foreign_keys = ON;
 """,
 """create table if not exists genre (
    id integer primary key asc autoincrement,
-   desc text not null
+   desc text not null,
+   weight real not null default 1
 );""",
 """create table if not exists tag (
    id integer primary key asc autoincrement,
-   name text not null
+   name text unique not null,
+   nameclean text not null
 );
 """,
 """create table if not exists song_x_tag (
@@ -93,7 +97,7 @@ FS_ENCODING = sys.getfilesystemencoding()
 
 class SubtreeListener(ProcessEvent):
    
-   def __init__(self, dbpath, queue):
+   def __init__(self, dbpath, queue, condition):
       self.db = dbapi.connect(dbpath)
       self.recents = []
       self.recentartists = {}
@@ -101,29 +105,50 @@ class SubtreeListener(ProcessEvent):
       self.recentgenres = {}
       self.recentsong = {}
       self.queue = queue
+      self.condition = condition
+      self.cookies = {}
       ProcessEvent.__init__(self)
 
    def process_IN_CREATE(self, evt):
       self.process_event(evt)
 
-   def process_IN_MOVED_TO(self, evt):
-      self.process_event(evt)
-
    def process_IN_CLOSE_WRITE(self, evt):
       self.process_event(evt)
 
+   def process_IN_MOVED_FROM(self, evt):
+      self.cookies[evt.cookie] = "%s/%s" % (evt.path, evt.item.name)
+
+   def process_IN_MOVED_TO(self, evt):
+      oldpath = self.cookies[evt.cookie]
+      newpath = "%s/%s" % (evt.path, evt.item.name)
+      self.condition.acquire()
+      self.db.execute("update song set path = ? where path = ?;", (oldpath.decode(FS_ENCODING), newpath.decode(FS_ENCODING)))
+      self.db.commit()
+      self.condition.release()
+
+   def process_IN_ISDIR(self, evt):
+      exists = self.db.execute("select id from song where path like = ? limit by 1;", ("%s%%" % evt.path,)).fetchone()
+      if not exists:
+         start_scan(evt.path, self.db, self.queue, self.condition, True)
+
    def process_IN_DELETE(self, evt):
-      abspathitem = "%s/%s" % (evt.path, evt.name)
+      abspathitem = "%s/%s" % (evt.path, evt.item.name)
       if abspathitem == dbpath:
          return
-      self.db.execute("delete from song where path = ?", abspathitem.decode(FS_ENCODING))
+
+      song_id = self.db.execute("select id from song where path = ?", (abspathitem.decode(FS_ENCODING),)).fetchone()[0]
+      self.condition.acquire()
+      self.db.execute("delete from song where id = ?", (song_id,))
+      self.db.execute("delete from song_x_tag where song_id = ?", (song_id,))
+      self.db.commit()
+      self.condition.release()
       if abspathitem in self.recents:
          self.recents.remove(abspathitem)
 
    def process_event(self, evt):
-      abspathitem = "%s/%s" % (evt.path, evt.name)
+      abspathitem = "%s/%s" % (evt.path, evt.item.name)
       if os.path.isdir(abspathitem):
-         start_scan(abspathitem, self.db, self.queue, True)
+         start_scan(abspathitem, self.db, self.queue, self.condition, True)
       else:
          if abspathitem in self.recents:
             return
@@ -136,13 +161,24 @@ class SubtreeListener(ProcessEvent):
                pass
          if not id3item:
             return
-         title = " ".join(id3item['TIT2'].text).strip().lower()
-         titleclean = re.sub("[^\w]*", "", title)
-         artist = " ".join(id3item['TPE1'].text).strip().lower()
-         album = " ".join(id3item['TALB'].text).strip().lower()
-         albumclean = re.sub("[^\w]*", "", album)
-         genre = " ".join(id3item['TCON'].text).strip().lower()
+         title = ""
+         titleclean = ""
+         artist = ""
+         album = ""
+         albumclean = ""
+         genre = ""
 
+         try:
+            title = " ".join(id3item['TIT2'].text).strip().lower()
+            titleclean = re.sub("[^\w]*", "", title)
+            artist = " ".join(id3item['TPE1'].text).strip().lower()
+            album = " ".join(id3item['TALB'].text).strip().lower()
+            albumclean = re.sub("[^\w]*", "", album)
+            genre = " ".join(id3item['TCON'].text).strip().lower()
+         except:
+            pass
+
+         self.condition.acquire()
          if not artist in self.recentartists.keys():
             if not self.db.execute("select id from artist where name = ?", (artist,)).fetchone():
                self.db.execute("insert into artist(name) values(?)", (artist,))
@@ -158,7 +194,10 @@ class SubtreeListener(ProcessEvent):
                self.db.execute("insert into genre(desc) values(?)", (genre,))
             self.recentgenres[genre] = self.db.execute("select id from genre where desc = ?", (genre,)).fetchone()[0]
          
-         self.db.execute("insert into song(title, titleclean, artist_id, genre_id, album_id, path) values (?,?,?,?,?,?)", (title, titleclean, self.recentartists[artist], self.recentgenres[genre], self.recentalbums[album], abspathitem.decode(FS_ENCODING)))
+         self.db.execute("insert or ignore into song(title, titleclean, artist_id, genre_id, album_id, path) values (?,?,?,?,?,?)", (title, titleclean, self.recentartists[artist], self.recentgenres[genre], self.recentalbums[album], abspathitem.decode(FS_ENCODING)))
+         self.db.commit()
+         self.condition.release()
+
          self.queue.put((abspathitem, title, artist))
 
          if len(self.recents) >= 20:
@@ -177,30 +216,65 @@ class SubtreeListener(ProcessEvent):
 
 class MetadataThread(threading.Thread):
 
-   def __init__(self, queue, dbpath):
+   def __init__(self, queue, condition, dbpath, bpmdetect):
       threading.Thread.__init__(self)
       self.queue = queue
+      self.condition = condition
       self.dbpath = dbpath
+      self.lastfm = pylast.LastFMNetwork( username = USERNAME)
+      self.lastfm.api_key = APIKEY
+      self.bpmdetect = bpmdetect
 
    def run(self):
-   
+
       self.db = dbapi.connect(self.dbpath)
       while True:
+         if self.bpmdetect:
+            sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", "30"], stdout = None, stderr = None) # well done, dear sox friend. Well done.
+            sox_process.wait()
+            bpm_process = subprocess.Popen(["/usr/bin/soundstretch", "/tmp/.stretch.wav", "-bpm", "-quick", "-naa"], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+            bpm_process.wait()
+            bpm_output = bpm_process.communicate()
+   
+            bpm_pattern = re.search ("Detected BPM rate ([0-9]+)", bpm_output[0], re.M)
+            if bpm_pattern:
+               bpm = float(bpm_pattern.groups()[0])
+            else:
+               bpm = 0.0
+
          path, title, artist = self.queue.get()
-         sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", "30"]) # well done, dear sox friend. Well done.
-         sox_process.wait()
-         bpm_process = subprocess.Popen(["/usr/bin/soundstretch", "/tmp/.stretch.wav", "-bpm", "-quick", "-naa"], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-         bpm_process.wait()
-         bpm_output = bpm_process.communicate()
+         try:
+            tags = self.lastfm.get_track(artist, title).get_top_tags()
+         except pylast.WSError:
+            tags = []
 
-         bpm_pattern = re.search ("Detected BPM rate ([0-9]+)", bpm_output[0], re.M)
-         if bpm_pattern:
-            bpm = float(bpm_pattern.groups()[0])
-         else:
-            bpm = 0.0
-
-         self.db.execute("update song set bpm = ? where path = ?", (bpm, path.decode(FS_ENCODING)))
+         self.condition.acquire()
+         song_id = self.db.execute("select id from song where path = ?", (path.decode(FS_ENCODING), )).fetchone()[0]
+         if self.bpmdetect:
+            self.db.execute("update song set bpm = ? where id = ?", (bpm, song_id))
+         known_tags = self.db.execute("select distinct weight, name, nameclean from song_x_tag left join tag on (tag_id = id) where song_id = ?;", (song_id,)).fetchall()
+         
+         for t in tags:
+            alreadytag = False
+            for kt in known_tags:
+               if t.item.name == kt[1] and t.weight != kt[0]:
+                  self.db.execute("update song_x_tag set weight = ? where song_id = ? and tag_id = ?;", (t.weight, song_id, t.item.name))
+                  alreadytag = True
+            if not alreadytag:
+               cleantag = re.sub("[^a-zA-Z0-9 ]", "", t.item.name).strip().lower().split()
+               tagcomb = permutations(cleantag, len(cleantag))
+               nameclean = "".join(cleantag)
+               for tc in tagcomb:
+                  similartag = self.db.execute("select nameclean from tag where name like ?;", ("%%%s%%" % "%".join(tc),)).fetchone()
+                  if similartag and len(similartag[0]) == len(nameclean):
+                     nameclean = similartag[0]
+               print "item.name: ", t.item.name, "nameclean: ", nameclean
+               self.db.execute("insert or ignore into tag (name, nameclean) values (?, ?);", (t.item.name, nameclean))
+               self.db.commit()
+               tagid = self.db.execute("select id from tag where name = ? ", (t.item.name, )).fetchone()[0]
+               self.db.execute("insert into song_x_tag (song_id, tag_id, weight) values (?, ?, ?);", (song_id, tagid, t.weight))
          self.db.commit()
+         self.condition.release()
 
 class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
    """
@@ -288,14 +362,6 @@ class CatalogThreadingTCPServer(ThreadingTCPServer):
       ThreadingTCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate=True)
       self.dbpath = dbpath
 
-#   def process_request(self, request, client_address):
-#      """Start a new thread to process the request."""
-#      t = threading.Thread(target = self.process_request_thread,
-#                           args = (request, client_address, self.dbpath))
-#      if self.daemon_threads:
-#          t.setDaemon (1)
-#      t.start()
-
 
 def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
 
@@ -329,13 +395,13 @@ def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
    os.dup2(se.fileno(), sys.stderr.fileno())
 
 
-def start_daemon(path, dbpath, queue):
+def start_daemon(path, dbpath, queue, condition):
    """ installs a subtree listener and wait for events """
    #daemonize()
 
    wm_auto = WatchManager()
-   subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_TO | IN_CREATE
-   notifier_sb = ThreadedNotifier(wm_auto, SubtreeListener(dbpath, queue))
+   subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_TO | IN_CREATE | IN_ISDIR
+   notifier_sb = ThreadedNotifier(wm_auto, SubtreeListener(dbpath, queue, condition))
    notifier_sb.start()
 
    wdd_sb = wm_auto.add_watch(path, subtreemask, rec=True)
@@ -343,7 +409,7 @@ def start_daemon(path, dbpath, queue):
    CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler, dbpath).serve_forever()
    
 
-def start_scan(path, db, queue, depth = 1):
+def start_scan(path, db, queue, condition, depth = 1):
    """ Breadth scan a subtree """
 
    scanpath = [path,]
@@ -369,13 +435,24 @@ def start_scan(path, db, queue, depth = 1):
                   pass
             if not id3item:
                continue
-            title = " ".join(id3item['TIT2'].text).strip().lower()
-            titleclean = re.sub("[^\w]*", "", title)
-            artist = " ".join(id3item['TPE1'].text).strip().lower()
-            album = " ".join(id3item['TALB'].text).strip().lower()
-            albumclean = re.sub("[^\w]*", "", album)
-            genre = " ".join(id3item['TCON'].text).strip().lower()
+            title = ""
+            titleclean = ""
+            artist = ""
+            album = ""
+            albumclean = ""
+            genre = ""
 
+            try:
+               title = " ".join(id3item['TIT2'].text).strip().lower()
+               titleclean = re.sub("[^\w]*", "", title)
+               artist = " ".join(id3item['TPE1'].text).strip().lower()
+               album = " ".join(id3item['TALB'].text).strip().lower()
+               albumclean = re.sub("[^\w]*", "", album)
+               genre = " ".join(id3item['TCON'].text).strip().lower()
+            except:
+               pass
+
+            condition.acquire()
             if not artist in recentartists.keys():
                if not db.execute("select id from artist where name = ?", (artist,)).fetchone():
                   db.execute("insert into artist(name) values(?)", (artist,))
@@ -393,7 +470,8 @@ def start_scan(path, db, queue, depth = 1):
             
             db.execute("insert into song(title, titleclean, artist_id, genre_id, album_id, path) values (?,?,?,?,?,?)", (title, titleclean, recentartists[artist], recentgenres[genre], recentalbums[album], abspathitem.decode(FS_ENCODING)))
             queue.put((abspathitem, title, artist))
-      db.commit()
+            db.commit()
+            condition.release()
 
 
 
@@ -425,6 +503,7 @@ usage: %s [-h|--help] [-s|--scan] [-d|--daemonize] [-n|--no-recursive] path\n
 \t-s --scan\tscan path and prepare db
 \t-d --daemonize\tstart daemon on path
 \t-n --no-recursive\tdo not scan subfolders
+\t-b --no-bpm\tdo not perform bpm detection (faster)
 """ % argv)
    sys.exit(1)
 
@@ -433,7 +512,7 @@ def perror(reason):
 
 if __name__ == "__main__":
 
-   opts, args = getopt(sys.argv[1:], "hsdn", ["help", "scan", "daemonize", "no-recursive"])
+   opts, args = getopt(sys.argv[1:], "hsdnb", ["help", "scan", "daemonize", "no-recursive", "no-bpm"])
 
    if not opts or not args:
       print_usage(sys.argv[0])
@@ -444,6 +523,7 @@ if __name__ == "__main__":
       recursive = True
       scan = False
       daemon = False
+      bpmdetect = True
       for opt in opts:
          if opt[0] in ("-h", "--help"):
             print_usage(sys.argv[0])
@@ -453,6 +533,8 @@ if __name__ == "__main__":
             daemon = True
          elif opt[0] in ("-n", "--no-recursive"):
             recursive = False
+         elif opt[0] in ("-b", "--no-bpm"):
+            bpmdetect = False
          else:
             perror("reading from command line: %s" % opt[0])
             sys.exit(1)
@@ -468,11 +550,12 @@ if __name__ == "__main__":
       prepare = not os.path.exists(dbpath)
       db = dbapi.connect(dbpath)
       queue = Queue()
-      MetadataThread(queue, dbpath).start()
+      condition = threading.Condition()
+      MetadataThread(queue, condition, dbpath, bpmdetect).start()
       if prepare:
          for sql in DBSCHEMA:
             db.execute(sql)
       if scan:
-         start_scan(patharg, db, queue, recursive)
+         start_scan(patharg, db, queue, condition, recursive)
       if daemon:
-         start_daemon(patharg, dbpath, queue)
+         start_daemon(patharg, dbpath, queue, condition)
