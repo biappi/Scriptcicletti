@@ -110,7 +110,7 @@ class SubtreeListener(ProcessEvent):
       self.recentartists = {}
       self.recentalbums = {}
       self.recentgenres = {}
-      self.recentsong = {}
+      self.recentsongs = {}
       self.md_queue = md_queue
       self.fd_queue = fd_queue
       self.condition = condition
@@ -160,56 +160,7 @@ class SubtreeListener(ProcessEvent):
       else:
          if abspathitem in self.recents:
             return
-         id3item = None
-         for decoder in DECODERS:
-            try:
-               id3item = decoder(abspathitem)
-               break
-            except: 
-               pass
-         if not id3item:
-            return
-         title = "unknown"
-         titleclean = "unknown"
-         artist = "unknown"
-         album = "unknown"
-         albumclean = "unknown"
-         genre = "unknown"
-         length = 0.0
-
-         try:
-            title = " ".join(id3item['TIT2'].text).strip().lower()
-            titleclean = re.sub("[^\w]*", "", title)
-            artist = " ".join(id3item['TPE1'].text).strip().lower()
-            album = " ".join(id3item['TALB'].text).strip().lower()
-            albumclean = re.sub("[^\w]*", "", album)
-            genre = " ".join(id3item['TCON'].text).strip().lower()
-            length = float(id3item['TLEN'])
-         except:
-            pass
-
-         self.condition.acquire()
-         if not artist in self.recentartists.keys():
-            if not self.db.execute("select id from artist where name = ?", (artist,)).fetchone():
-               self.db.execute("insert into artist(name) values(?)", (artist,))
-            self.recentartists[artist] = self.db.execute("select id from artist where name = ?", (artist,)).fetchone()[0]
- 
-         if not album in self.recentalbums.keys():
-            if not self.db.execute("select id from album where titleclean = ?", (album,)).fetchone():
-               self.db.execute("insert into album(title, titleclean) values(?, ?)", (album, albumclean))
-            self.recentalbums[album] = self.db.execute("select id from album where titleclean = ?", (albumclean,)).fetchone()[0]
- 
-         if not genre in self.recentgenres.keys():
-            if not self.db.execute("select id from genre where desc = ?", (genre,)).fetchone():
-               self.db.execute("insert into genre(desc) values(?)", (genre,))
-            self.recentgenres[genre] = self.db.execute("select id from genre where desc = ?", (genre,)).fetchone()[0]
-         
-         self.db.execute("insert or ignore into song(title, titleclean, artist_id, genre_id, album_id, path, length) values (?,?,?,?,?,?,?)", (title, titleclean, self.recentartists[artist], self.recentgenres[genre], self.recentalbums[album], abspathitem.decode(FS_ENCODING), length))
-         self.db.commit()
-         self.condition.release()
-
-         self.md_queue.put((abspathitem, title, artist))
-         self.fd_queue.put((abspathitem, title, artist))
+         collect_metadata(abspathitem, self.db, self.recentartists, self.recentalbums, self.recentgenres, self.md_queue, self.fd_queue)
 
          if len(self.recents) >= 20:
             self.recents.pop(0)
@@ -284,10 +235,10 @@ class MetadataThread(threading.Thread):
          except:
             tags = []
 
+         self.condition.acquire()
          song_id = self.db.execute("select id from song where path = ?", (path.decode(FS_ENCODING), )).fetchone()[0]
          known_tags = self.db.execute("select distinct weight, name, nameclean from song_x_tag left join tag on (tag_id = id) where song_id = ?;", (song_id,)).fetchall()
          
-         self.condition.acquire()
          for t in tags:
             alreadytag = False
             for kt in known_tags:
@@ -302,7 +253,6 @@ class MetadataThread(threading.Thread):
                   similartag = self.db.execute("select nameclean from tag where name like ?;", ("%%%s%%" % "%".join(tc),)).fetchone()
                   if similartag and len(similartag[0]) == len(nameclean):
                      nameclean = similartag[0]
-               #print "item.name: ", t.item.name, "nameclean: ", nameclean
                self.db.execute("insert or ignore into tag (name, nameclean) values (?, ?);", (t.item.name, nameclean))
                self.db.commit()
                tagid = self.db.execute("select id from tag where name = ? ", (t.item.name, )).fetchone()[0]
@@ -338,7 +288,7 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
 
       db = dbapi.connect(self.server.dbpath)
 
-      songquery = "select distinct s.id as id, s.title as title, a.name as artist, g.desc as genre, al.title as album, s.path as path from song s left join genre g on (s.genre_id = g.id) left join artist a on (s.artist_id = a.id) left join album al on (s.album_id = al.id)"
+      songquery = "select distinct s.id as id, s.title as title, a.name as artist, g.desc as genre, al.title as album, s.path as path, s.length as length, s.bpm as bpm from song s left join genre g on (s.genre_id = g.id) left join artist a on (s.artist_id = a.id) left join album al on (s.album_id = al.id)"
       results = ""
 
       try:
@@ -365,6 +315,21 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
             pass
 
          elif items[0] == "aggregate":
+            requests = items[2].split(',')
+            if items[1] == 'genre':
+               query = "%s where genre in ( %s );" % (songquery, ",".join(['?' for i in xrange(0,len(requests))]))
+               results = self.m3u(db.execute(query, requests).fetchall())
+               self.send_response(200)
+            elif items[1] == 'bpm':
+               query = "%s where bpm  between ? - 10 and ? + 10 ;"
+               results = self.m3u(db.execute(query, requests).fetchall())
+               self.send_response(200)
+            elif items[1] == 'date':
+               pass
+            else:
+               self.send_response(404)
+
+         elif items[0] == "smart":
             pass
 
       except Exception as e:
@@ -382,7 +347,7 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
 
    def m3u(self, songtuple):
 
-      extm3u = """#EXTM3U\n%s""" % "\n".join(["""#EXTINF:1,%s - %s\n%s\n""" % (i[2], i[1], i[5]) for i in songtuple])
+      extm3u = """#EXTM3U\n%s\n""" % "\n".join(["""#EXTINF:%d,%s - %s\n%s""" % (i[6], i[2], i[1], i[5]) for i in songtuple])
       return extm3u 
 
    def html(self, songtuple):
@@ -465,60 +430,65 @@ def start_scan(path, db, md_queue, fd_queue, condition, depth = 1):
          if os.path.isdir(abspathitem) and depth:
             scanpath.append(abspathitem)
          else:
-            id3item = None
-            for decoder in DECODERS:
-               try:
-                  id3item = decoder(abspathitem)
-                  break
-               except: 
-                  pass
-            if not id3item:
-               continue
-            title = "unknown"
-            titleclean = "unknown"
-            artist = "unknown"
-            album = "unknown"
-            albumclean = "unknown"
-            genre = "unknown"
-            length = 0.0
+            collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres, md_queue, fd_queue)
 
-            try:
-               title = " ".join(id3item['TIT2'].text).strip().lower()
-               titleclean = re.sub("[^\w]*", "", title)
-               artist = " ".join(id3item['TPE1'].text).strip().lower()
-               album = " ".join(id3item['TALB'].text).strip().lower()
-               albumclean = re.sub("[^\w]*", "", album)
-               genre = " ".join(id3item['TCON'].text).strip().lower()
-               length = float(id3item['TLEN'])
-            except:
-               pass
 
-            condition.acquire()
-            if not artist in recentartists.keys():
-               if not db.execute("select id from artist where name = ?", (artist,)).fetchone():
-                  db.execute("insert into artist(name) values(?)", (artist,))
-                  db.commit()
-               recentartists[artist] = db.execute("select id from artist where name = ?", (artist,)).fetchone()[0]
+def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres, md_queue, fd_queue):
+   
+   id3item = None
+   for decoder in DECODERS:
+      try:
+         id3item = decoder(abspathitem)
+         break
+      except Exception as e:
+         pass
+   if not id3item:
+     return 
+   title = "unknown"
+   titleclean = "unknown"
+   artist = "unknown"
+   album = "unknown"
+   albumclean = "unknown"
+   genre = "unknown"
+   length = 0.0
 
-            if not album in recentalbums.keys():
-               if not db.execute("select id from album where titleclean = ?", (album,)).fetchone():
-                  db.execute("insert into album(title, titleclean) values(?, ?)", (album, albumclean))
-                  db.commit()
-               recentalbums[album] = db.execute("select id from album where titleclean = ?", (albumclean,)).fetchone()[0]
+   try:
+      title = " ".join(id3item['TIT2'].text).strip().lower()
+      titleclean = re.sub("[^\w]*", "", title)
+      artist = " ".join(id3item['TPE1'].text).strip().lower()
+      album = " ".join(id3item['TALB'].text).strip().lower()
+      albumclean = re.sub("[^\w]*", "", album)
+      genre = " ".join(id3item['TCON'].text).strip().lower()
+      length = float(id3item['TLEN'])
+   except:
+      pass
 
-            if not genre in recentgenres.keys():
-               if not db.execute("select id from genre where desc = ?", (genre,)).fetchone():
-                  db.execute("insert into genre(desc) values(?)", (genre,))
-                  db.commit()
-               recentgenres[genre] = db.execute("select id from genre where desc = ?", (genre,)).fetchone()[0]
-            condition.release()
+   condition.acquire()
+   if not artist in recentartists.keys():
+      if not db.execute("select id from artist where name = ?", (artist,)).fetchone():
+         db.execute("insert into artist(name) values(?)", (artist,))
+         db.commit()
+      recentartists[artist] = db.execute("select id from artist where name = ?", (artist,)).fetchone()[0]
 
-            condition.acquire()
-            db.execute("insert or ignore into song(title, titleclean, artist_id, genre_id, album_id, path, length) values (?,?,?,?,?,?,?)", (title, titleclean, recentartists[artist], recentgenres[genre], recentalbums[album], abspathitem.decode(FS_ENCODING), length))
-            md_queue.put((abspathitem, title, artist))
-            fd_queue.put((abspathitem, title, artist))
-            db.commit()
-            condition.release()
+   if not album in recentalbums.keys():
+      if not db.execute("select id from album where titleclean = ?", (album,)).fetchone():
+         db.execute("insert into album(title, titleclean) values(?, ?)", (album, albumclean))
+         db.commit()
+      recentalbums[album] = db.execute("select id from album where titleclean = ?", (albumclean,)).fetchone()[0]
+
+   if not genre in recentgenres.keys():
+      if not db.execute("select id from genre where desc = ?", (genre,)).fetchone():
+         db.execute("insert into genre(desc) values(?)", (genre,))
+         db.commit()
+      recentgenres[genre] = db.execute("select id from genre where desc = ?", (genre,)).fetchone()[0]
+   condition.release()
+
+   condition.acquire()
+   db.execute("insert or ignore into song(title, titleclean, artist_id, genre_id, album_id, path, length) values (?,?,?,?,?,?,?)", (title, titleclean, recentartists[artist], recentgenres[genre], recentalbums[album], abspathitem.decode(FS_ENCODING), length))
+   md_queue.put((abspathitem, title, artist))
+   fd_queue.put((abspathitem, title, artist))
+   db.commit()
+   condition.release()
 
 
 
