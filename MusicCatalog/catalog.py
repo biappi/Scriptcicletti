@@ -192,12 +192,12 @@ class FiledataThread(threading.Thread):
       while True:
          path, title, artist = self.queue.get()
          soxi_process = subprocess.Popen(["/usr/bin/soxi", "-D", path], stdout = subprocess.PIPE)
-         soxi_process.wait()
+         #soxi_process.wait()
          soxi_output = float(soxi_process.communicate()[0])
          sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", "30"], stdout = None, stderr = None) # well done, dear sox friend. Well done.
          sox_process.wait()
          bpm_process = subprocess.Popen(["/usr/bin/soundstretch", "/tmp/.stretch.wav", "-bpm", "-quick", "-naa"], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-         bpm_process.wait()
+         #bpm_process.wait()
          bpm_output = bpm_process.communicate()
    
          bpm_pattern = re.search ("Detected BPM rate ([0-9]+)", bpm_output[0], re.M)
@@ -234,6 +234,9 @@ class MetadataThread(threading.Thread):
             tags = self.lastfm.get_track(artist, title).get_top_tags()
          except:
             tags = []
+         
+         if not tags:
+            continue
 
          self.condition.acquire()
          song_id = self.db.execute("select id from song where path = ?", (path.decode(FS_ENCODING), )).fetchone()[0]
@@ -246,7 +249,20 @@ class MetadataThread(threading.Thread):
                   self.db.execute("update song_x_tag set weight = ? where song_id = ? and tag_id = ?;", (t.weight, song_id, t.item.name))
                   alreadytag = True
             if not alreadytag:
-               cleantag = re.sub("[^a-zA-Z0-9 ]", "", t.item.name).strip().lower().split()
+               if re.match("^([a-zA-Z0-9] )+[a-zA-Z0-9]$", t.item.name): # you damned "e l e c t r o n i c" tag.
+                  cleantag = [re.sub("[^a-zA-Z0-9]+", "", t.item.name)]
+               else:
+                  cleantag = re.sub("[^a-zA-Z0-9 ]+", "", t.item.name).strip().lower().split()
+
+               savedcleantag = []
+               savedcleantag.extend(cleantag)
+               for i in xrange(len(cleantag), 0):
+                  if len(cleantag[i]) < 3:
+                     cleantag.pop(i)
+                     
+               if len(cleantag) > 6:
+                  cleantag = [" ".join(savedcleantag)] # as a single phrase
+
                tagcomb = permutations(cleantag, len(cleantag))
                nameclean = "".join(cleantag)
                for tc in tagcomb:
@@ -341,9 +357,13 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
       data.write(results)
       data.seek(0)
 
+      self.send_header("Content-Type", "text/plain")
       self.end_headers()
       self.copyfile(data, self.wfile)
 
+
+   def do_HEAD(self):
+      pass
 
    def m3u(self, songtuple):
 
@@ -565,6 +585,9 @@ if __name__ == "__main__":
             sys.exit(1)
          elif arg[-1:] == "/":
             patharg = arg[:-1]
+            break
+         else:
+            patharg = arg
             break
 
       dbpath = "%s/.%s.sqlite" % (patharg, os.path.basename(patharg))
