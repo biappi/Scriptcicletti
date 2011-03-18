@@ -1,5 +1,15 @@
 #!/usr/bin/env python2.6
+#
+# A music library managaer and smart aggregator
+# featuring http-based playlist request and automatic generation
+#
+# requirements: pysqlite, pylast, mutagen, pyinotify
+# optional requirements: sox, soundstretch
 
+__version__ = '0.5'
+__author__ = 'radiocicletta <radiocicletta@gmail.com>'
+
+from parameters import * # a file parameters.py containing last.fm variables USERNAME and APIKEY
 import sqlite3 as dbapi
 import sys
 import os
@@ -24,10 +34,9 @@ from Queue import Queue
 import subprocess
 import signal
 from itertools import permutations
-from parameters import *
 from urllib import unquote
 
-try:
+try: #TODO: add FSEvents support
    from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE, IN_ISDIR, IN_MOVED_FROM
 except:
    pass
@@ -421,7 +430,7 @@ def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
 
 def start_daemon(path, dbpath, md_queue, fd_queue, condition):
    """ installs a subtree listener and wait for events """
-   #daemonize()
+   daemonize()
 
    wm_auto = WatchManager()
    subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_TO | IN_CREATE | IN_ISDIR
