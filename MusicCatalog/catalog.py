@@ -160,12 +160,16 @@ class SubtreeListener(ProcessEvent):
       if abspathitem == dbpath:
          return
 
-      song_id = self.db.execute("select id from song where path = ?", (abspathitem.decode(FS_ENCODING),)).fetchone()[0]
       self.condition.acquire()
-      self.db.execute("delete from song where id = ?", (song_id,))
-      self.db.execute("delete from song_x_tag where song_id = ?", (song_id,))
-      self.db.commit()
-      self.condition.release()
+      try:
+         song_id = self.db.execute("select id from song where path = ?", (abspathitem.decode(FS_ENCODING),)).fetchone()[0]
+         self.db.execute("delete from song where id = ?", (song_id,))
+         self.db.execute("delete from song_x_tag where song_id = ?", (song_id,))
+         self.db.commit()
+      except:
+         pass
+      finally:
+         self.condition.release()
       if abspathitem in self.recents:
          self.recents.remove(abspathitem)
 
@@ -327,27 +331,31 @@ class PollAnalyzer(threading.Thread):
                for j in xrange(0, len(known_genres)):
                   if i == j:
                      continue
-                  compared_genre = re.split("[/,]", known_genres[j][1])
-                  distance = 0
+                  compared_genre = re.split("[/, ]", known_genres[j][1])
+                  distance = {} 
                   for a in splitted_genre:
                      if not a:
                         continue
                      for b in compared_genre:
-                        if not b:
+                        if not b or b in distance:
                            continue
                         if len(a) == len(b):
-                           distance = distance + hamming(a, b) / float(len(a) + len(b))
+                           distance[b] = hamming(a, b) / float(len(a))
                         else:
-                           distance = distance + levenshtein(a, b) / float(len(a) + len(b))
-                  #similarity = 1.0 / (distance * len(splitted_genre) * len(compared_genre))
-                  #similarity = (len(splitted_genre) * len(compared_genre)) / float(distance)
-                  similarity = float(distance) / (len(splitted_genre) + len(compared_genre))
+                           distance[b] = levenshtein(a, b) / float(max(len(a), len(b)))
+                  if distance:
+                     # geometric mean
+                     similarity =  1.0 - (reduce(lambda x, y: x*y, distance.values()))**(1.0/len(distance))
+                  else:
+                     similarity = 0.0
                   if similarity > 0.33:
                      db.execute("insert or replace into genre_x_genre (id_genre, id_related_genre, similarity) values ( ?, ?, ?)", (known_genres[i][0], known_genres[j][0], similarity))
                      commit = True
                if commit:
                   db.commit()
                self.condition.release()
+         else:
+            print "NO"
          db.close()
          sleep(300)
 
