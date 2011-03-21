@@ -35,6 +35,8 @@ import subprocess
 import signal
 from itertools import permutations
 from urllib import unquote
+import traceback
+from time import sleep
 
 try: #TODO: add FSEvents support
    from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE, IN_ISDIR, IN_MOVED_FROM
@@ -49,7 +51,7 @@ DBSCHEMA = ( """
 PRAGMA foreign_keys = ON;
 """,
 """create table if not exists db (
-   version text default "0.3",
+   version text default "0.4",
    tree text not null
 );""",
 """create table if not exists artist (
@@ -79,6 +81,11 @@ PRAGMA foreign_keys = ON;
    id integer primary key asc autoincrement,
    desc text not null,
    weight real not null default 1
+);""",
+"""create table if not exists genre_x_genre (
+   id_genre integer not null,
+   id_related_genre integer not null,
+   similarity real not null default 0.0
 );""",
 """create table if not exists tag (
    id integer primary key asc autoincrement,
@@ -285,6 +292,65 @@ class MetadataThread(threading.Thread):
          self.db.commit()
          self.condition.release()
 
+class PollAnalyzer(threading.Thread):
+
+   daemon = True
+
+   def __init__(self, condition, dbpath):
+      threading.Thread.__init__(self)
+      self.condition = condition
+      self.dbpath = dbpath
+
+   def run(self):
+
+      while True:
+         #sleep(300)
+         db = dbapi.connect(dbpath)
+         self.condition.acquire()
+         collected_genres = db.execute("select distinct count(id_genre) from genre_x_genre;").fetchall()
+         complete_genres = db.execute("select count(id) from genre;").fetchall()
+         self.condition.release()
+
+         if not collected_genres or not complete_genres:
+            genres_count = 0
+         else:
+            genres_count = collected_genres[0][0] - complete_genres[0][0]
+
+         if genres_count:
+            self.condition.acquire()
+            known_genres = db.execute("select distinct id, desc from genre").fetchall()
+            self.condition.release()
+            commit = False
+            for i in xrange(0, len(known_genres)):
+               splitted_genre = re.split("[/,]", known_genres[i][1])
+               self.condition.acquire()
+               for j in xrange(0, len(known_genres)):
+                  if i == j:
+                     continue
+                  compared_genre = re.split("[/,]", known_genres[j][1])
+                  distance = 0
+                  for a in splitted_genre:
+                     if not a:
+                        continue
+                     for b in compared_genre:
+                        if not b:
+                           continue
+                        if len(a) == len(b):
+                           distance = distance + hamming(a, b) / float(len(a) + len(b))
+                        else:
+                           distance = distance + levenshtein(a, b) / float(len(a) + len(b))
+                  #similarity = 1.0 / (distance * len(splitted_genre) * len(compared_genre))
+                  #similarity = (len(splitted_genre) * len(compared_genre)) / float(distance)
+                  similarity = float(distance) / (len(splitted_genre) + len(compared_genre))
+                  if similarity > 0.33:
+                     db.execute("insert or replace into genre_x_genre (id_genre, id_related_genre, similarity) values ( ?, ?, ?)", (known_genres[i][0], known_genres[j][0], similarity))
+                     commit = True
+               if commit:
+                  db.commit()
+               self.condition.release()
+         db.close()
+         sleep(300)
+
 class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
    """
          a HTTPRequestHandler that perform queries on db
@@ -322,7 +388,7 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
             args = ()
             if len(items) % 2 == 0:
                query = "select * from %s;" % items[-1]
-               results = self.html(db.execute(query).fetchall())
+               results = self.text(db.execute(query).fetchall())
                self.send_response(200)
             else:
                for i in range(1, len(items), 2):
@@ -339,7 +405,7 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
          elif items[0] == "smart":
             pass
 
-         elif items[0] == "aggregate":
+         elif items[0] == "aggregate" and len(items) == 3:
             requests = items[2].split(',')
             if items[1] == 'genre':
                query = "%s where genre in ( %s );" % (songquery, ",".join(['?' for i in xrange(0,len(requests))]))
@@ -360,9 +426,10 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
       except Exception as e:
          self.send_response(500)
          self.end_headers()
-         results = e.__str__()
+         results = str(e)
 
       data = StringIO()
+      print results
       data.write(results)
       data.seek(0)
 
@@ -377,12 +444,12 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
    def m3u(self, songtuple):
 
       extm3u = """#EXTM3U\n%s\n""" % "\n".join(["""#EXTINF:%d,%s - %s\n%s""" % (i[6], i[2], i[1], i[5]) for i in songtuple])
-      return extm3u 
+      return unicode(extm3u).encode('utf-8')
 
-   def html(self, songtuple):
+   def text(self, songtuple):
 
-      htmldoc = """<html>\n<body>\n<table>%s</table></body>\n</html>""" % "\n".join(["<tr><td>%s</td></tr>" % "</td><td>".join([str(j) for j in i]) for i in songtuple])
-      return htmldoc
+      textdoc = "\n".join(["| %s |" % " | ".join([unicode(j).encode("utf-8") for j in i]) for i in songtuple])
+      return textdoc
 
 
 
@@ -430,7 +497,8 @@ def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
 
 def start_daemon(path, dbpath, md_queue, fd_queue, condition):
    """ installs a subtree listener and wait for events """
-   daemonize()
+   #daemonize()
+   os.nice(19)
 
    wm_auto = WatchManager()
    subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_TO | IN_CREATE | IN_ISDIR
@@ -439,6 +507,7 @@ def start_daemon(path, dbpath, md_queue, fd_queue, condition):
 
    wdd_sb = wm_auto.add_watch(path, subtreemask, rec=True)
 
+   PollAnalyzer(condition, dbpath).start()
    CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler, dbpath).serve_forever()
    
 
@@ -498,13 +567,17 @@ def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres,
          db.execute("insert into artist(name) values(?)", (artist,))
          db.commit()
       recentartists[artist] = db.execute("select id from artist where name = ?", (artist,)).fetchone()[0]
+   condition.release()
 
+   condition.acquire()
    if not album in recentalbums.keys():
       if not db.execute("select id from album where titleclean = ?", (album,)).fetchone():
          db.execute("insert into album(title, titleclean) values(?, ?)", (album, albumclean))
          db.commit()
       recentalbums[album] = db.execute("select id from album where titleclean = ?", (albumclean,)).fetchone()[0]
+   condition.release()
 
+   condition.acquire()
    if not genre in recentgenres.keys():
       if not db.execute("select id from genre where desc = ?", (genre,)).fetchone():
          db.execute("insert into genre(desc) values(?)", (genre,))
@@ -541,6 +614,8 @@ def levenshtein(a,b): # Dr. levenshtein, i presume.
 
    return current[n]
 
+def hamming(a, b):
+   return sum(c_a != c_b for c_a, c_b in zip(a, b))
 
 def print_usage(argv):
    print("""
