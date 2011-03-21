@@ -1,0 +1,60 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+	<head>
+		<meta http-equiv="content-type" content="text/html; charset=utf-8" />
+		
+		<title>Graziella DB</title>
+		<style type="text/css" title="currentStyle">
+			@import "media/demo_page.css";
+			@import "media/demo_table.css";
+		</style>
+		<script type="text/javascript" language="javascript" src="media/jquery.js"></script>
+		<script type="text/javascript" language="javascript" src="media/jquery.dataTables.js"></script>
+		<script type="text/javascript" charset="utf-8">
+			$(document).ready(function() {
+				$('#example').dataTable({
+					'bProcessing': true,
+					'bPaginate': false,
+					'bLengthChange': false,
+					'iDisplayLength': 25,
+					'sScrollY': '600px',
+					'sAjaxSource': 'netlabels.json'
+				});
+			} );
+		</script>
+	</head>
+	<body id="dt_example">
+		<div id="container">
+			<div class="full_width big">
+				Graziella Music Database
+			</div>
+			
+			<div id="demo">
+<table cellpadding="0" cellspacing="0" border="0" class="display" id="example">
+	<thead>
+		<tr>
+			<th>Artist</th>
+			<th>Album</th>
+			<th>Song</th>
+		</tr>
+	</thead>
+	<tbody>
+	</tbody>
+	<tfoot>
+		<tr>
+			<th>Artist</th>
+			<th>Album</th>
+			<th>Song</th>
+		</tr>
+	</tfoot>
+</table>
+			</div>
+
+			<div id="footer" style="text-align:center;">
+				<span style="font-size:10px;">
+					Graziella is with you.
+				</span>
+			</div>
+		</div>
+	</body>
+</html>
