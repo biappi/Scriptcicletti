@@ -25,6 +25,7 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.optimfrog import OptimFROG
 from mutagen.trueaudio import TrueAudio
 from mutagen.wavpack import WavPack
+from ID3 import ID3
 from collections import defaultdict
 import re
 from getopt import getopt, gnu_getopt
@@ -119,9 +120,11 @@ DECODERS = (MP3, FLAC, MP4, MonkeysAudio, Musepack, WavPack, TrueAudio, OggVorbi
 FS_ENCODING = sys.getfilesystemencoding()
 
 class SubtreeListener(ProcessEvent):
+   """ handler for inotify thread events """
    
    def __init__(self, dbpath, md_queue, fd_queue, condition):
-      self.db = dbapi.connect(dbpath)
+      #self.db = dbapi.connect(dbpath)
+      self.dbpath = dbpath
       self.recents = []
       self.recentartists = {}
       self.recentalbums = {}
@@ -140,47 +143,58 @@ class SubtreeListener(ProcessEvent):
       self.process_event(evt)
 
    def process_IN_MOVED_FROM(self, evt):
-      self.cookies[evt.cookie] = "%s/%s" % (evt.path, evt.name)
+      #self.cookies[evt.cookie] = "%s/%s" % (evt.path, evt.name)
+      self.process_IN_DELETE(evt)
 
    def process_IN_MOVED_TO(self, evt):
-      oldpath = self.cookies[evt.cookie]
+      #oldpath = self.cookies[evt.cookie]
       newpath = "%s/%s" % (evt.path, evt.name)
-      self.condition.acquire()
-      self.db.execute("update song set path = ? where path = ?;", (oldpath.decode(FS_ENCODING), newpath.decode(FS_ENCODING)))
-      self.db.commit()
-      self.condition.release()
+      if os.path.isdir(newpath):
+         self.process_IN_ISDIR(evt)
+      else:
+         self.process_event(evt)
+      #self.con4dition.acquire()
+      #self.db.execute("update song set path = ? where path = ?;", (oldpath.decode(FS_ENCODING), newpath.decode(FS_ENCODING)))
+      #self.db.commit()
+      #self.condition.release()
 
    def process_IN_ISDIR(self, evt):
-      exists = self.db.execute("select id from song where path like = ? limit by 1;", ("%s%%" % evt.path,)).fetchone()
+      db = dbapi.connect(dbpath)
+      exists = db.execute("select id from song where path like ? limit 1;", ("%s%%" % evt.path,)).fetchone()
       if not exists:
-         start_scan(evt.path, self.db, self.md_queue, self.fd_queue, self.condition, True)
+         start_scan(evt.path, db, self.md_queue, self.fd_queue, self.condition, True)
+      db.close()
 
    def process_IN_DELETE(self, evt):
       abspathitem = "%s/%s" % (evt.path, evt.name)
       if abspathitem == dbpath:
          return
 
+      db = dbapi.connect(dbpath)
       self.condition.acquire()
       try:
-         song_id = self.db.execute("select id from song where path = ?", (abspathitem.decode(FS_ENCODING),)).fetchone()[0]
-         self.db.execute("delete from song where id = ?", (song_id,))
-         self.db.execute("delete from song_x_tag where song_id = ?", (song_id,))
-         self.db.commit()
+         song_id = db.execute("select id from song where path = ?", (abspathitem.decode(FS_ENCODING),)).fetchone()[0]
+         db.execute("delete from song where id = ?", (song_id,))
+         db.execute("delete from song_x_tag where song_id = ?", (song_id,))
+         db.commit()
       except:
          pass
       finally:
          self.condition.release()
+      db.close()
       if abspathitem in self.recents:
          self.recents.remove(abspathitem)
 
    def process_event(self, evt):
+      db = dbapi.connect(dbpath)
       abspathitem = "%s/%s" % (evt.path, evt.name)
       if os.path.isdir(abspathitem):
-         start_scan(abspathitem, self.db, self.md_queue, self.fd_queue, self.condition, True)
+         start_scan(abspathitem, db, self.md_queue, self.fd_queue, self.condition, True)
       else:
          if abspathitem in self.recents:
+            db.close()
             return
-         collect_metadata(abspathitem, self.db, self.recentartists, self.recentalbums, self.recentgenres, self.md_queue, self.fd_queue)
+         collect_metadata(abspathitem, db, self.recentartists, self.recentalbums, self.recentgenres, self.md_queue, self.fd_queue)
 
          if len(self.recents) >= 20:
             self.recents.pop(0)
@@ -194,9 +208,11 @@ class SubtreeListener(ProcessEvent):
             self.recentsongs.clear()
          if len(self.recentartists) > 20:
             self.recentartists.clear()
+      db.close()
 
 
 class FiledataThread(threading.Thread):
+   """ slow file analyzer thread. Retrieve song's length and bpm where availble """
 
    daemon = True
 
@@ -212,12 +228,10 @@ class FiledataThread(threading.Thread):
       while True:
          path, title, artist = self.queue.get()
          soxi_process = subprocess.Popen(["/usr/bin/soxi", "-D", path], stdout = subprocess.PIPE)
-         #soxi_process.wait()
          soxi_output = float(soxi_process.communicate()[0])
          sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", "30"], stdout = None, stderr = None) # well done, dear sox friend. Well done.
          sox_process.wait()
          bpm_process = subprocess.Popen(["/usr/bin/soundstretch", "/tmp/.stretch.wav", "-bpm", "-quick", "-naa"], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-         #bpm_process.wait()
          bpm_output = bpm_process.communicate()
    
          bpm_pattern = re.search ("Detected BPM rate ([0-9]+)", bpm_output[0], re.M)
@@ -232,6 +246,7 @@ class FiledataThread(threading.Thread):
          self.condition.release()
 
 class MetadataThread(threading.Thread):
+   """ last.fm client Thread. Collect top tags for each song """
    
    daemon = True
 
@@ -297,6 +312,7 @@ class MetadataThread(threading.Thread):
          self.condition.release()
 
 class PollAnalyzer(threading.Thread):
+   """ Analyzer for genres. Collect informations about (lexicographically) similar genres """
 
    daemon = True
 
@@ -308,7 +324,7 @@ class PollAnalyzer(threading.Thread):
    def run(self):
 
       while True:
-         #sleep(300)
+         sleep(300)
          db = dbapi.connect(dbpath)
          self.condition.acquire()
          collected_genres = db.execute("select distinct count(id_genre) from genre_x_genre;").fetchall()
@@ -357,7 +373,6 @@ class PollAnalyzer(threading.Thread):
          else:
             print "NO"
          db.close()
-         sleep(300)
 
 class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
    """
@@ -416,8 +431,21 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
          elif items[0] == "aggregate" and len(items) == 3:
             requests = items[2].split(',')
             if items[1] == 'genre':
-               query = "%s where genre in ( %s );" % (songquery, ",".join(['?' for i in xrange(0,len(requests))]))
-               results = self.m3u(db.execute(query, requests).fetchall())
+               ids = [i[0] for i in db.execute("select id from genre where desc in ( %s )" %  ",".join(['?' for i in xrange(0,len(requests))]), requests).fetchall()]
+               query = "%s where genre in ( %s ) order by random();" % (songquery, ",".join(['?' for i in xrange(0,len( ids ))]))
+               primary_results = db.execute(query, ids).fetchall()
+
+               related_requests = "select distinct id_related_genre from genre_x_genre where id_genre in ( %s ) and similarity = 1" %  ",".join(['?' for i in xrange(0,len( ids ))])
+               related_ids = [i[0] for i in db.execute(related_requests, ids).fetchall()]
+               
+               if related_ids:
+                  related_query = "%s where s.genre_id in ( %s ) order by random();" % (songquery, ",".join(['?' for i in xrange(0,len( related_ids ))]))
+                  secondary_results = db.execute(related_query, related_ids).fetchall()
+               else:
+                  secondary_results = []
+
+               results = self.m3u(primary_results + secondary_results)
+
                self.send_response(200)
             elif items[1] == 'bpm':
                query = "%s where bpm  between ? - 10 and ? + 10 ;"
@@ -437,7 +465,6 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
          results = str(e)
 
       data = StringIO()
-      print results
       data.write(results)
       data.seek(0)
 
@@ -509,7 +536,7 @@ def start_daemon(path, dbpath, md_queue, fd_queue, condition):
    os.nice(19)
 
    wm_auto = WatchManager()
-   subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_TO | IN_CREATE | IN_ISDIR
+   subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_ISDIR
    notifier_sb = ThreadedNotifier(wm_auto, SubtreeListener(dbpath, md_queue, fd_queue, condition))
    notifier_sb.start()
 
@@ -540,22 +567,37 @@ def start_scan(path, db, md_queue, fd_queue, condition, depth = 1):
 
 
 def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres, md_queue, fd_queue):
+   """ id3 tags retriever """
    
    id3item = None
+   id3v1item = {'TITLE':'', 'ARTIST':'', 'ALBUM':'', 'GENRE':''}
    for decoder in DECODERS:
       try:
          id3item = decoder(abspathitem)
+         id3v1item = ID3(abspathitem).as_dict()
          break
       except Exception as e:
          pass
    if not id3item:
      return 
-   title = "unknown"
-   titleclean = "unknown"
-   artist = "unknown"
-   album = "unknown"
+   if 'TITLE' in id3v1item:
+      title = id3v1item['TITLE'].strip().lower()
+   else:
+      title = "unknown"
+   titleclean ="unknown"
+   if 'TITLE' in id3v1item:
+      artist = id3v1item['ARTIST'].strip().lower()
+   else:
+      artist = "unknown"
+   if 'TITLE' in id3v1item:
+      album = id3v1item['ALBUM'].strip().lower()
+   else:
+      album = "unknown"
    albumclean = "unknown"
-   genre = "unknown"
+   if 'TITLE' in id3v1item:
+      genre = id3v1item['GENRE'].strip().lower()
+   else:
+      genre = "unknown"
    length = 0.0
 
    try:
@@ -594,7 +636,7 @@ def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres,
    condition.release()
 
    condition.acquire()
-   db.execute("insert or ignore into song(title, titleclean, artist_id, genre_id, album_id, path, length) values (?,?,?,?,?,?,?)", (title, titleclean, recentartists[artist], recentgenres[genre], recentalbums[album], abspathitem.decode(FS_ENCODING), length))
+   db.execute("insert or replace into song(title, titleclean, artist_id, genre_id, album_id, path, length) values (?,?,?,?,?,?,?)", (title, titleclean, recentartists[artist], recentgenres[genre], recentalbums[album], abspathitem.decode(FS_ENCODING), length))
    md_queue.put((abspathitem, title, artist))
    fd_queue.put((abspathitem, title, artist))
    db.commit()
@@ -623,6 +665,7 @@ def levenshtein(a,b): # Dr. levenshtein, i presume.
    return current[n]
 
 def hamming(a, b):
+   """ calculate the Hamming distance between a and b """
    return sum(c_a != c_b for c_a, c_b in zip(a, b))
 
 def print_usage(argv):
