@@ -31,7 +31,7 @@ import re
 from getopt import getopt, gnu_getopt
 import pylast
 import threading
-from Queue import Queue
+from Queue import Queue, Empty
 import subprocess
 import signal
 from itertools import permutations
@@ -118,6 +118,7 @@ PRAGMA foreign_keys = ON;
 
 DECODERS = (MP3, FLAC, MP4, MonkeysAudio, Musepack, WavPack, TrueAudio, OggVorbis, OggTheora, OggSpeex, OggFLAC)
 FS_ENCODING = sys.getfilesystemencoding()
+THREADS = []
 
 class SubtreeListener(ProcessEvent):
    """ handler for inotify thread events """
@@ -221,12 +222,19 @@ class FiledataThread(threading.Thread):
       self.queue = queue
       self.condition = condition
       self.dbpath = dbpath
+      self.running = True
+
+   def stop(self):
+      self.running = False
 
    def run(self):
 
       self.db = dbapi.connect(self.dbpath)
-      while True:
-         path, title, artist = self.queue.get()
+      while self.running:
+         try:
+            path, title, artist = self.queue.get(True, 1.0)
+         except Empty:
+            continue
          soxi_process = subprocess.Popen(["/usr/bin/soxi", "-D", path], stdout = subprocess.PIPE)
          soxi_output = float(soxi_process.communicate()[0])
          sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", "30"], stdout = None, stderr = None) # well done, dear sox friend. Well done.
@@ -244,6 +252,7 @@ class FiledataThread(threading.Thread):
          self.db.execute("update song set bpm = ?, length = ? where path = ?", (bpm, soxi_output, path.decode(FS_ENCODING)))
          self.db.commit()
          self.condition.release()
+      self.db.close()
 
 class MetadataThread(threading.Thread):
    """ last.fm client Thread. Collect top tags for each song """
@@ -258,12 +267,19 @@ class MetadataThread(threading.Thread):
       self.dbpath = dbpath
       self.lastfm = pylast.LastFMNetwork( username = USERNAME)
       self.lastfm.api_key = APIKEY
+      self.running = True 
+
+   def stop(self):
+      self.running = False
 
    def run(self):
 
       self.db = dbapi.connect(self.dbpath)
-      while True:
-         path, title, artist = self.queue.get()
+      while self.running:
+         try:
+            path, title, artist = self.queue.get(True, 1.0)
+         except Empty:
+            continue
 
          try:
             tags = self.lastfm.get_track(artist, title).get_top_tags()
@@ -310,6 +326,7 @@ class MetadataThread(threading.Thread):
                self.db.execute("insert into song_x_tag (song_id, tag_id, weight) values (?, ?, ?);", (song_id, tagid, t.weight))
          self.db.commit()
          self.condition.release()
+      self.db.close()
 
 class PollAnalyzer(threading.Thread):
    """ Analyzer for genres. Collect informations about (lexicographically) similar genres """
@@ -320,10 +337,14 @@ class PollAnalyzer(threading.Thread):
       threading.Thread.__init__(self)
       self.condition = condition
       self.dbpath = dbpath
+      self.running = True
+
+   def stop(self):
+      self.running = False
 
    def run(self):
 
-      while True:
+      while self.running:
          sleep(300)
          db = dbapi.connect(dbpath)
          self.condition.acquire()
@@ -342,6 +363,8 @@ class PollAnalyzer(threading.Thread):
             self.condition.release()
             commit = False
             for i in xrange(0, len(known_genres)):
+               if not self.running:
+                  break
                splitted_genre = re.split("[/,]", known_genres[i][1])
                self.condition.acquire()
                for j in xrange(0, len(known_genres)):
@@ -432,7 +455,7 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
             requests = items[2].split(',')
             if items[1] == 'genre':
                ids = [i[0] for i in db.execute("select id from genre where desc in ( %s )" %  ",".join(['?' for i in xrange(0,len(requests))]), requests).fetchall()]
-               query = "%s where genre in ( %s ) order by random();" % (songquery, ",".join(['?' for i in xrange(0,len( ids ))]))
+               query = "%s where s.genre_id in ( %s ) order by random();" % (songquery, ",".join(['?' for i in xrange(0,len( ids ))]))
                primary_results = db.execute(query, ids).fetchall()
 
                related_requests = "select distinct id_related_genre from genre_x_genre where id_genre in ( %s ) and similarity = 1" %  ",".join(['?' for i in xrange(0,len( ids ))])
@@ -472,6 +495,7 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
       self.end_headers()
       self.copyfile(data, self.wfile)
 
+      db.close()
 
    def do_HEAD(self):
       pass
@@ -493,9 +517,19 @@ class CatalogThreadingTCPServer(ThreadingTCPServer):
 
    allow_reuse_address = True
 
+   def stop(self):
+      self.shutdown()
+
    def __init__(self, server_address, RequestHandlerClass, dbpath, bind_and_activate=True):
       ThreadingTCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate=True)
       self.dbpath = dbpath
+
+   def serve_forever(self, poll=0.5):
+      try:
+         ThreadingTCPServer.serve_forever(self, poll)
+      except KeyboardInterrupt:
+         self.shutdown()
+         os.kill(os.getpid(), signal.SIGTERM)
 
 
 def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
@@ -532,18 +566,21 @@ def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
 
 def start_daemon(path, dbpath, md_queue, fd_queue, condition):
    """ installs a subtree listener and wait for events """
-   #daemonize()
+   daemonize()
    os.nice(19)
 
    wm_auto = WatchManager()
    subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_ISDIR
    notifier_sb = ThreadedNotifier(wm_auto, SubtreeListener(dbpath, md_queue, fd_queue, condition))
    notifier_sb.start()
+   THREADS.append(notifier_sb)
 
    wdd_sb = wm_auto.add_watch(path, subtreemask, rec=True)
 
-   PollAnalyzer(condition, dbpath).start()
-   CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler, dbpath).serve_forever()
+   THREADS.append(PollAnalyzer(condition, dbpath))
+   THREADS[-1].start()
+   THREADS.append(CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler, dbpath))
+   THREADS[-1].serve_forever()
    
 
 def start_scan(path, db, md_queue, fd_queue, condition, depth = 1):
@@ -585,16 +622,16 @@ def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres,
    else:
       title = "unknown"
    titleclean ="unknown"
-   if 'TITLE' in id3v1item:
+   if 'ARTIST' in id3v1item:
       artist = id3v1item['ARTIST'].strip().lower()
    else:
       artist = "unknown"
-   if 'TITLE' in id3v1item:
+   if 'ALBUM' in id3v1item:
       album = id3v1item['ALBUM'].strip().lower()
    else:
       album = "unknown"
    albumclean = "unknown"
-   if 'TITLE' in id3v1item:
+   if 'GENRE' in id3v1item:
       genre = id3v1item['GENRE'].strip().lower()
    else:
       genre = "unknown"
@@ -671,11 +708,11 @@ def hamming(a, b):
 def print_usage(argv):
    print("""
 usage: %s [-h|--help] [-s|--scan] [-d|--daemonize] [-n|--no-recursive] path\n
-\t-h --help\tprint this help
-\t-s --scan\tscan path and prepare db
-\t-d --daemonize\tstart daemon on path
-\t-n --no-recursive\tdo not scan subfolders
-\t-b --no-bpm\tdo not perform bpm detection (faster)
+\t-h --help           print this help
+\t-s --scan           scan path and prepare db
+\t-d --daemonize      start daemon on path
+\t-n --no-recursive   do not scan subfolders
+\t-b --no-bpm         do not perform bpm detection (faster)
 """ % argv)
    sys.exit(1)
 
@@ -683,7 +720,12 @@ def perror(reason):
    print("error %s\ntry -h option for usage" % reason)
 
 def shutdown(signum, stack):
-   pass
+   for t in THREADS:
+      try:
+         t.stop()
+      except:
+         pass
+   sys.exit(0)
    
 
 if __name__ == "__main__":
@@ -735,11 +777,14 @@ if __name__ == "__main__":
       filedataqueue = Queue()
       condition = threading.Condition()
 
-      MetadataThread(metadataqueue, condition, dbpath).start()
+      THREADS.append(MetadataThread(metadataqueue, condition, dbpath))
+      THREADS[-1].start()
       if bpmdetect:
-         FiledataThread(filedataqueue, condition, dbpath).start()
+         THREADS.append(FiledataThread(filedataqueue, condition, dbpath))
+         THREADS[-1].start()
 
       if scan:
          start_scan(patharg, db, metadataqueue, filedataqueue, condition, recursive)
       if daemon:
+         signal.signal(signal.SIGTERM, shutdown)
          start_daemon(patharg, dbpath, metadataqueue, filedataqueue, condition)
