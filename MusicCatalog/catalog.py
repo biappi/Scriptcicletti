@@ -144,20 +144,14 @@ class SubtreeListener(ProcessEvent):
       self.process_event(evt)
 
    def process_IN_MOVED_FROM(self, evt):
-      #self.cookies[evt.cookie] = "%s/%s" % (evt.path, evt.name)
       self.process_IN_DELETE(evt)
 
    def process_IN_MOVED_TO(self, evt):
-      #oldpath = self.cookies[evt.cookie]
       newpath = "%s/%s" % (evt.path, evt.name)
       if os.path.isdir(newpath):
          self.process_IN_ISDIR(evt)
       else:
          self.process_event(evt)
-      #self.con4dition.acquire()
-      #self.db.execute("update song set path = ? where path = ?;", (oldpath.decode(FS_ENCODING), newpath.decode(FS_ENCODING)))
-      #self.db.commit()
-      #self.condition.release()
 
    def process_IN_ISDIR(self, evt):
       db = dbapi.connect(dbpath)
@@ -232,7 +226,7 @@ class FiledataThread(threading.Thread):
       self.db = dbapi.connect(self.dbpath)
       while self.running:
          try:
-            path, title, artist = self.queue.get(True, 1.0)
+            path, title, artist = self.queue.get()
          except Empty:
             continue
          soxi_process = subprocess.Popen(["/usr/bin/soxi", "-D", path], stdout = subprocess.PIPE)
@@ -277,7 +271,7 @@ class MetadataThread(threading.Thread):
       self.db = dbapi.connect(self.dbpath)
       while self.running:
          try:
-            path, title, artist = self.queue.get(True, 1.0)
+            path, title, artist = self.queue.get()
          except Empty:
             continue
 
