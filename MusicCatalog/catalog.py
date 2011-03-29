@@ -40,11 +40,11 @@ import traceback
 from time import sleep
 
 try: #TODO: add FSEvents support
-   from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE, IN_ISDIR, IN_MOVED_FROM
+   from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, ExcludeFilter, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE, IN_ISDIR, IN_MOVED_FROM
 except:
    pass
 
-from SocketServer import ThreadingTCPServer
+from SocketServer import ThreadingTCPServer, ForkingTCPServer
 from SimpleHTTPServer import SimpleHTTPRequestHandler
 from StringIO import StringIO
 
@@ -124,7 +124,6 @@ class SubtreeListener(ProcessEvent):
    """ handler for inotify thread events """
    
    def __init__(self, dbpath, md_queue, fd_queue, condition):
-      #self.db = dbapi.connect(dbpath)
       self.dbpath = dbpath
       self.recents = []
       self.recentartists = {}
@@ -165,8 +164,8 @@ class SubtreeListener(ProcessEvent):
       if abspathitem == dbpath:
          return
 
-      db = dbapi.connect(dbpath)
       self.condition.acquire()
+      db = dbapi.connect(dbpath)
       try:
          song_id = db.execute("select id from song where path = ?", (abspathitem.decode(FS_ENCODING),)).fetchone()[0]
          db.execute("delete from song where id = ?", (song_id,))
@@ -175,12 +174,14 @@ class SubtreeListener(ProcessEvent):
       except:
          pass
       finally:
+         db.close()
          self.condition.release()
-      db.close()
       if abspathitem in self.recents:
          self.recents.remove(abspathitem)
 
    def process_event(self, evt):
+      if evt.pathname == self.dbpath:
+         return
       db = dbapi.connect(dbpath)
       abspathitem = "%s/%s" % (evt.path, evt.name)
       if os.path.isdir(abspathitem):
@@ -229,18 +230,20 @@ class FiledataThread(threading.Thread):
             path, title, artist = self.queue.get()
          except Empty:
             continue
-         soxi_process = subprocess.Popen(["/usr/bin/soxi", "-D", path], stdout = subprocess.PIPE)
-         soxi_output = float(soxi_process.communicate()[0])
-         sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", "30"], stdout = None, stderr = None) # well done, dear sox friend. Well done.
-         sox_process.wait()
-         bpm_process = subprocess.Popen(["/usr/bin/soundstretch", "/tmp/.stretch.wav", "-bpm", "-quick", "-naa"], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-         bpm_output = bpm_process.communicate()
+         for i in ('30', '60', '90'):
+            soxi_process = subprocess.Popen(["/usr/bin/soxi", "-D", path], stdout = subprocess.PIPE)
+            soxi_output = float(soxi_process.communicate()[0])
+            sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", i], stdout = None, stderr = None) # well done, dear sox friend. Well done.
+            sox_process.wait()
+            bpm_process = subprocess.Popen(["/usr/bin/soundstretch", "/tmp/.stretch.wav", "-bpm", "-quick", "-naa"], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+            bpm_output = bpm_process.communicate()
    
-         bpm_pattern = re.search ("Detected BPM rate ([0-9]+)", bpm_output[0], re.M)
-         if bpm_pattern:
-            bpm = float(bpm_pattern.groups()[0])
-         else:
-            bpm = 0.0
+            bpm_pattern = re.search ("Detected BPM rate ([0-9]+)", bpm_output[0], re.M)
+            if bpm_pattern:
+               bpm = float(bpm_pattern.groups()[0])
+               break
+            else:
+               bpm = 0.0
 
          self.condition.acquire()
          self.db.execute("update song set bpm = ?, length = ? where path = ?", (bpm, soxi_output, path.decode(FS_ENCODING)))
@@ -338,20 +341,21 @@ class PollAnalyzer(threading.Thread):
 
    def run(self):
 
+      sleeptime = 600
+      complete_genres = 0
       while self.running:
-         sleep(300)
+         sleep(max(300, sleeptime))
          db = dbapi.connect(dbpath)
          self.condition.acquire()
-         collected_genres = db.execute("select distinct count(id_genre) from genre_x_genre;").fetchall()
-         complete_genres = db.execute("select count(id) from genre;").fetchall()
+         collected_genres = db.execute("select count(id) from genre;").fetchall()
          self.condition.release()
 
-         if not collected_genres or not complete_genres:
-            genres_count = 0
-         else:
-            genres_count = collected_genres[0][0] - complete_genres[0][0]
+         genres_count = complete_genres - collected_genres[0][0]
 
-         if genres_count:
+         if genres_count == 0:
+            sleeptime = (sleeptime + 6) % 36
+         else:
+            sleeptime = sleeptime / 2
             self.condition.acquire()
             known_genres = db.execute("select distinct id, desc from genre").fetchall()
             self.condition.release()
@@ -382,13 +386,14 @@ class PollAnalyzer(threading.Thread):
                   else:
                      similarity = 0.0
                   if similarity > 0.33:
-                     db.execute("insert or replace into genre_x_genre (id_genre, id_related_genre, similarity) values ( ?, ?, ?)", (known_genres[i][0], known_genres[j][0], similarity))
-                     commit = True
+                     if not db.execute("select * from genre_x_genre where id_genre = ? and id_related_genre = ?", (known_genres[i][0], known_genres[j][0])).fetchall():
+                        db.execute("insert into genre_x_genre (id_genre, id_related_genre, similarity) values ( ?, ?, ?)", (known_genres[i][0], known_genres[j][0], similarity))
+                        commit = True
                if commit:
                   db.commit()
+               complete_genres = db.execute("select count(id) from genre;").fetchall()[0][0]
                self.condition.release()
-         else:
-            print "NO"
+            sleep(sleeptime)
          db.close()
 
 class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
@@ -506,6 +511,7 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
 
 
 
+#class CatalogThreadingTCPServer(ForkingTCPServer):
 class CatalogThreadingTCPServer(ThreadingTCPServer):
    """a threaded tcp server interfaced with a database"""
 
@@ -516,15 +522,8 @@ class CatalogThreadingTCPServer(ThreadingTCPServer):
 
    def __init__(self, server_address, RequestHandlerClass, dbpath, bind_and_activate=True):
       ThreadingTCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate=True)
+      #ForkingTCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate=True)
       self.dbpath = dbpath
-
-   def serve_forever(self, poll=0.5):
-      try:
-         ThreadingTCPServer.serve_forever(self, poll)
-      except KeyboardInterrupt:
-         self.shutdown()
-         os.kill(os.getpid(), signal.SIGTERM)
-
 
 def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
 
@@ -565,16 +564,19 @@ def start_daemon(path, dbpath, md_queue, fd_queue, condition):
 
    wm_auto = WatchManager()
    subtreemask = IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_ISDIR
+   excludefilter = ExcludeFilter(["(.*)sqlite"])
    notifier_sb = ThreadedNotifier(wm_auto, SubtreeListener(dbpath, md_queue, fd_queue, condition))
    notifier_sb.start()
    THREADS.append(notifier_sb)
 
-   wdd_sb = wm_auto.add_watch(path, subtreemask, rec=True)
+   wdd_sb = wm_auto.add_watch(path, subtreemask, rec=True, exclude_filter=excludefilter)
 
    THREADS.append(PollAnalyzer(condition, dbpath))
    THREADS[-1].start()
    THREADS.append(CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler, dbpath))
    THREADS[-1].serve_forever()
+
+   THREADS[-1].join()
    
 
 def start_scan(path, db, md_queue, fd_queue, condition, depth = 1):
@@ -781,4 +783,7 @@ if __name__ == "__main__":
          start_scan(patharg, db, metadataqueue, filedataqueue, condition, recursive)
       if daemon:
          signal.signal(signal.SIGTERM, shutdown)
-         start_daemon(patharg, dbpath, metadataqueue, filedataqueue, condition)
+         try:
+            start_daemon(patharg, dbpath, metadataqueue, filedataqueue, condition)
+         except KeyboardInterrupt:
+            os.kill(os.getpid(), signal.SIGTERM)
