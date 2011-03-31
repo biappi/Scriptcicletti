@@ -137,15 +137,19 @@ class SubtreeListener(ProcessEvent):
       ProcessEvent.__init__(self)
 
    def process_IN_CREATE(self, evt):
+      print "IN_CREATE"
       self.process_event(evt)
 
    def process_IN_CLOSE_WRITE(self, evt):
+      print "IN_CLOSE_WRITE"
       self.process_event(evt)
 
    def process_IN_MOVED_FROM(self, evt):
+      print "IN_MOVED_FROM"
       self.process_IN_DELETE(evt)
 
    def process_IN_MOVED_TO(self, evt):
+      print "IN_MOVED_TO"
       newpath = "%s/%s" % (evt.path, evt.name)
       if os.path.isdir(newpath):
          self.process_IN_ISDIR(evt)
@@ -153,25 +157,36 @@ class SubtreeListener(ProcessEvent):
          self.process_event(evt)
 
    def process_IN_ISDIR(self, evt):
+      print "IN_ISDIR"
+      newpath = "%s/%s" % (evt.path, evt.name)
       db = dbapi.connect(dbpath)
-      exists = db.execute("select id from song where path like ? limit 1;", ("%s%%" % evt.path,)).fetchone()
-      if not exists:
-         start_scan(evt.path, db, self.md_queue, self.fd_queue, self.condition, True)
+      #exists = db.execute("select id from song where path like ? limit 1;", ("%s%%" % evt.path,)).fetchone()
+      #if not exists:
+      start_scan(newpath, db, self.md_queue, self.fd_queue, self.condition, True)
       db.close()
 
    def process_IN_DELETE(self, evt):
+      print "IN_DELETE"
       abspathitem = "%s/%s" % (evt.path, evt.name)
-      if abspathitem == dbpath:
+      if abspathitem in (dbpath, "%s-journal" % dbpath):
          return
 
       self.condition.acquire()
       db = dbapi.connect(dbpath)
       try:
-         song_id = db.execute("select id from song where path = ?", (abspathitem.decode(FS_ENCODING),)).fetchone()[0]
-         db.execute("delete from song where id = ?", (song_id,))
-         db.execute("delete from song_x_tag where song_id = ?", (song_id,))
+         if evt.dir: #os.path.isdir(abspathitem):
+            songs = db.execute("select id from song where path like ?;", ("%s%%" % abspathitem.decode(FS_ENCODING),))
+            song_id = songs.fetchall()
+            self.recents = []
+         else:
+            songs = db.execute("select id from song where path = ?;", (abspathitem.decode(FS_ENCODING),))
+            song_id = songs.fetchone()
+         for s_i in song_id:
+            db.execute("delete from song where id = ?;", s_i)
+            db.execute("delete from song_x_tag where song_id = ?;", s_i)
          db.commit()
-      except:
+      except Exception as e:
+         print "OH CRAP CRAP", e
          pass
       finally:
          db.close()
@@ -569,7 +584,7 @@ def start_daemon(path, dbpath, md_queue, fd_queue, condition):
    notifier_sb.start()
    THREADS.append(notifier_sb)
 
-   wdd_sb = wm_auto.add_watch(path, subtreemask, rec=True, exclude_filter=excludefilter)
+   wdd_sb = wm_auto.add_watch(path, subtreemask, auto_add=True, rec=True, exclude_filter=excludefilter)
 
    THREADS.append(PollAnalyzer(condition, dbpath))
    THREADS[-1].start()
@@ -670,6 +685,7 @@ def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres,
 
    condition.acquire()
    db.execute("insert or replace into song(title, titleclean, artist_id, genre_id, album_id, path, length) values (?,?,?,?,?,?,?)", (title, titleclean, recentartists[artist], recentgenres[genre], recentalbums[album], abspathitem.decode(FS_ENCODING), length))
+   print "pushing on threads..."
    md_queue.put((abspathitem, title, artist))
    fd_queue.put((abspathitem, title, artist))
    db.commit()
