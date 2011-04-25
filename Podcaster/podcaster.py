@@ -47,6 +47,8 @@ if __name__ == "__main__":
    # 1a. extract length
    length = float(commands.getoutput("/usr/bin/soxi -D %s" % filename))
    stop_datetime = start_datetime + datetime.timedelta(0, length)
+   if verbose:
+      print "analying period %s - %s" % (start_datetime, stop_datetime)
 
    # 2. extract cuepoints from talk.log
    talksheetfile = open(talksheet, "r")
@@ -54,7 +56,7 @@ if __name__ == "__main__":
    splitstart = []
    pad = datetime.timedelta(0, 15, 0)
    for line in talksheetfile:
-      match = re.search(" ([a-zA-Z ]{3} %s %d (%s):[0-9:]* [A-Z]{1,3} %d) \] - mic_" % (MAPMONTH[start_datetime.month], start_datetime.day, "|".join(["%02d" % i for i in range(start_datetime.hour, stop_datetime.hour + 1)]), start_datetime.year), line)
+      match = re.search(" ([a-zA-Z ]{3} %s %d (%s):[0-9:]* [A-Z]{1,4} %d) \] - mic_" % (MAPMONTH[start_datetime.month], start_datetime.day, "|".join(["%02d" % i for i in range(start_datetime.hour, stop_datetime.hour + 1)]), start_datetime.year), line)
       if match:
          cue = datetime.datetime.strptime(match.groups()[0], "%a %b %d %H:%M:%S %Z %Y")
          if not splits: # init

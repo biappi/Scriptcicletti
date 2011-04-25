@@ -38,6 +38,8 @@ from itertools import permutations
 from urllib import unquote
 import traceback
 from time import sleep
+import logging
+from collections import deque
 
 try: #TODO: add FSEvents support
    from pyinotify import WatchManager, Notifier, ThreadedNotifier, EventsCodes, ProcessEvent, ExcludeFilter, IN_CREATE, IN_MOVED_TO, IN_CLOSE_WRITE, IN_DELETE, IN_ISDIR, IN_MOVED_FROM
@@ -52,7 +54,7 @@ DBSCHEMA = ( """
 PRAGMA foreign_keys = ON;
 """,
 """create table if not exists db (
-   version text default "0.4",
+   version text default "0.5",
    tree text not null
 );""",
 """create table if not exists artist (
@@ -81,7 +83,10 @@ PRAGMA foreign_keys = ON;
 """create table if not exists genre (
    id integer primary key asc autoincrement,
    desc text not null,
-   weight real not null default 1
+   descclean text not null,
+   weight real not null default 1,
+   bpm real,
+   bpmavg real
 );""",
 """create table if not exists genre_x_genre (
    id_genre integer not null,
@@ -111,7 +116,7 @@ PRAGMA foreign_keys = ON;
    date integer
 );
 """,
-"""insert into genre (desc) values ('unknown') ;""",
+"""insert into genre (desc, descclean) values ('unknown', 'unknown') ;""",
 """insert into artist (name) values ('unknown') ;""",
 """insert into album (title, titleclean) values ('unknown', 'unknown') ;"""
 )
@@ -119,6 +124,7 @@ PRAGMA foreign_keys = ON;
 DECODERS = (MP3, FLAC, MP4, MonkeysAudio, Musepack, WavPack, TrueAudio, OggVorbis, OggTheora, OggSpeex, OggFLAC)
 FS_ENCODING = sys.getfilesystemencoding()
 THREADS = []
+logging.basicConfig(filename="/tmp/cata.log",level=logging.DEBUG)
 
 class SubtreeListener(ProcessEvent):
    """ handler for inotify thread events """
@@ -136,20 +142,22 @@ class SubtreeListener(ProcessEvent):
       self.cookies = {}
       ProcessEvent.__init__(self)
 
-   def process_IN_CREATE(self, evt):
-      print "IN_CREATE"
-      self.process_event(evt)
-
    def process_IN_CLOSE_WRITE(self, evt):
-      print "IN_CLOSE_WRITE"
+      if evt.name[0] == '.':
+         return
+      logging.debug( "IN_CLOSE_WRITE")
       self.process_event(evt)
 
    def process_IN_MOVED_FROM(self, evt):
-      print "IN_MOVED_FROM"
+      if evt.name[0] == '.':
+         return
+      logging.debug( "IN_MOVED_FROM")
       self.process_IN_DELETE(evt)
 
    def process_IN_MOVED_TO(self, evt):
-      print "IN_MOVED_TO"
+      if evt.name[0] == '.':
+         return
+      logging.debug( "IN_MOVED_TO")
       newpath = "%s/%s" % (evt.path, evt.name)
       if os.path.isdir(newpath):
          self.process_IN_ISDIR(evt)
@@ -157,7 +165,9 @@ class SubtreeListener(ProcessEvent):
          self.process_event(evt)
 
    def process_IN_ISDIR(self, evt):
-      print "IN_ISDIR"
+      if evt.name[0] == '.':
+         return
+      logging.debug( "IN_ISDIR")
       newpath = "%s/%s" % (evt.path, evt.name)
       db = dbapi.connect(dbpath)
       #exists = db.execute("select id from song where path like ? limit 1;", ("%s%%" % evt.path,)).fetchone()
@@ -166,7 +176,9 @@ class SubtreeListener(ProcessEvent):
       db.close()
 
    def process_IN_DELETE(self, evt):
-      print "IN_DELETE"
+      if evt.name[0] == '.':
+         return
+      logging.debug( "IN_DELETE")
       abspathitem = "%s/%s" % (evt.path, evt.name)
       if abspathitem in (dbpath, "%s-journal" % dbpath):
          return
@@ -186,7 +198,7 @@ class SubtreeListener(ProcessEvent):
             db.execute("delete from song_x_tag where song_id = ?;", s_i)
          db.commit()
       except Exception as e:
-         print "OH CRAP CRAP", e
+         logging.debug( "OH CRAP CRAP %s " % e)
          pass
       finally:
          db.close()
@@ -205,7 +217,7 @@ class SubtreeListener(ProcessEvent):
          if abspathitem in self.recents:
             db.close()
             return
-         collect_metadata(abspathitem, db, self.recentartists, self.recentalbums, self.recentgenres, self.md_queue, self.fd_queue)
+         collect_metadata(abspathitem, db, self.recentartists, self.recentalbums, self.recentgenres, self.md_queue, self.fd_queue, self.condition)
 
          if len(self.recents) >= 20:
             self.recents.pop(0)
@@ -239,19 +251,33 @@ class FiledataThread(threading.Thread):
 
    def run(self):
 
+      logging.debug("FiledataThread Started")
       self.db = dbapi.connect(self.dbpath)
       while self.running:
          try:
+            logging.debug("getting queue...")
             path, title, artist = self.queue.get()
+            logging.debug("done.\n")
          except Empty:
+            logging.debug("fail.\n")
             continue
-         for i in ('30', '60', '90'):
-            soxi_process = subprocess.Popen(["/usr/bin/soxi", "-D", path], stdout = subprocess.PIPE)
+         except Exception as e:
+            logging.debug("%s.\n" % e)
+            pass
+         if not path:
+            continue
+         for i in ('30', '60', '90', '120'):
+            logging.debug("soxi_process...")
+            soxi_process = subprocess.Popen(["/usr/bin/soxi", "-D", path], stdout = subprocess.PIPE, stderr = subprocess.PIPE)
             soxi_output = float(soxi_process.communicate()[0])
-            sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", i], stdout = None, stderr = None) # well done, dear sox friend. Well done.
-            sox_process.wait()
-            bpm_process = subprocess.Popen(["/usr/bin/soundstretch", "/tmp/.stretch.wav", "-bpm", "-quick", "-naa"], stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+            logging.debug("sox_process...")
+            sox_process = subprocess.Popen(["/usr/bin/sox", path, "-t", "wav", "/tmp/.stretch.wav", "trim", "0", i], stdout = subprocess.PIPE, stderr = subprocess.PIPE) # well done, dear sox friend. Well done.
+            #sox_process.wait()
+            sox_process.communicate()
+            logging.debug("bpm_process...")
+            bpm_process = subprocess.Popen(["/usr/bin/soundstretch", "/tmp/.stretch.wav", "-bpm", "-quick", "-naa"], stdout = subprocess.PIPE, stderr = subprocess.PIPE)
             bpm_output = bpm_process.communicate()
+            logging.debug("done.\n")
    
             bpm_pattern = re.search ("Detected BPM rate ([0-9]+)", bpm_output[0], re.M)
             if bpm_pattern:
@@ -291,6 +317,10 @@ class MetadataThread(threading.Thread):
          try:
             path, title, artist = self.queue.get()
          except Empty:
+            continue
+         except:
+            pass
+         if not path:
             continue
 
          try:
@@ -372,34 +402,42 @@ class PollAnalyzer(threading.Thread):
          else:
             sleeptime = sleeptime / 2
             self.condition.acquire()
-            known_genres = db.execute("select distinct id, desc from genre").fetchall()
+            known_genres = db.execute("select distinct id, desc, descclean from genre").fetchall()
             self.condition.release()
             commit = False
             for i in xrange(0, len(known_genres)):
                if not self.running:
                   break
-               splitted_genre = re.split("[/,]", known_genres[i][1])
+               splitted_genre = re.split("[/,;]", known_genres[i][1])
                self.condition.acquire()
                for j in xrange(0, len(known_genres)):
                   if i == j:
                      continue
-                  compared_genre = re.split("[/, ]", known_genres[j][1])
-                  distance = {} 
-                  for a in splitted_genre:
-                     if not a:
-                        continue
-                     for b in compared_genre:
-                        if not b or b in distance:
-                           continue
-                        if len(a) == len(b):
-                           distance[b] = hamming(a, b) / float(len(a))
-                        else:
-                           distance[b] = levenshtein(a, b) / float(max(len(a), len(b)))
-                  if distance:
-                     # geometric mean
-                     similarity =  1.0 - (reduce(lambda x, y: x*y, distance.values()))**(1.0/len(distance))
+                  if known_genres[i][2] == known_genres[j][2]:
+                     similarity = 1.0
                   else:
-                     similarity = 0.0
+                     compared_genre = re.split("[/,;]", known_genres[j][1])
+                     distance = {}
+                     sametags = 0
+                     for a in splitted_genre:
+                        if not a:
+                           continue
+                        for b in compared_genre:
+                           if not b or b in distance:
+                              continue
+                           if len(a) == len(b):
+                              h = hamming(a, b) / float(len(a))
+                              if h:
+                                 distance[b] = h
+                              else:
+                                sametags = sametags + 1
+                           else:
+                              distance[b] = levenshtein(a, b) / float(max(len(a), len(b)))
+                     if distance:
+                        # geometric mean + weighted equal tags
+                        similarity =  1.0 - (reduce(lambda x, y: x*y, distance.values()))**(1.0/len(distance)) + (sametags / (sametags + len(distance)))
+                     else:
+                        similarity = 0.0
                   if similarity > 0.33:
                      if not db.execute("select * from genre_x_genre where id_genre = ? and id_related_genre = ?", (known_genres[i][0], known_genres[j][0])).fetchall():
                         db.execute("insert into genre_x_genre (id_genre, id_related_genre, similarity) values ( ?, ?, ?)", (known_genres[i][0], known_genres[j][0], similarity))
@@ -472,7 +510,7 @@ class CatalogHTTPRequestHandler(SimpleHTTPRequestHandler):
                query = "%s where s.genre_id in ( %s ) order by random();" % (songquery, ",".join(['?' for i in xrange(0,len( ids ))]))
                primary_results = db.execute(query, ids).fetchall()
 
-               related_requests = "select distinct id_related_genre from genre_x_genre where id_genre in ( %s ) and similarity = 1" %  ",".join(['?' for i in xrange(0,len( ids ))])
+               related_requests = "select distinct id_related_genre from genre_x_genre where id_genre in ( %s ) and similarity > 0.98" %  ",".join(['?' for i in xrange(0,len( ids ))])
                related_ids = [i[0] for i in db.execute(related_requests, ids).fetchall()]
                
                if related_ids:
@@ -574,7 +612,6 @@ def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
 
 def start_daemon(path, dbpath, md_queue, fd_queue, condition):
    """ installs a subtree listener and wait for events """
-   daemonize()
    os.nice(19)
 
    wm_auto = WatchManager()
@@ -588,8 +625,8 @@ def start_daemon(path, dbpath, md_queue, fd_queue, condition):
 
    THREADS.append(PollAnalyzer(condition, dbpath))
    THREADS[-1].start()
-   THREADS.append(CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler, dbpath))
-   THREADS[-1].serve_forever()
+#   THREADS.append(CatalogThreadingTCPServer(("localhost", 8080), CatalogHTTPRequestHandler, dbpath))
+#   THREADS[-1].serve_forever()
 
    THREADS[-1].join()
    
@@ -611,10 +648,10 @@ def start_scan(path, db, md_queue, fd_queue, condition, depth = 1):
          if os.path.isdir(abspathitem) and depth:
             scanpath.append(abspathitem)
          else:
-            collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres, md_queue, fd_queue)
+            collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres, md_queue, fd_queue, condition)
 
 
-def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres, md_queue, fd_queue):
+def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres, md_queue, fd_queue, condition):
    """ id3 tags retriever """
    
    id3item = None
@@ -630,22 +667,26 @@ def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres,
      return 
    if 'TITLE' in id3v1item:
       title = id3v1item['TITLE'].strip().lower()
+      titleclean = re.sub("[^\w]*", "", title)
    else:
       title = "unknown"
-   titleclean ="unknown"
+      titleclean ="unknown"
    if 'ARTIST' in id3v1item:
       artist = id3v1item['ARTIST'].strip().lower()
    else:
       artist = "unknown"
    if 'ALBUM' in id3v1item:
       album = id3v1item['ALBUM'].strip().lower()
+      albumclean = re.sub("[^\w]*", "", album)
    else:
       album = "unknown"
-   albumclean = "unknown"
+      albumclean = "unknown"
    if 'GENRE' in id3v1item:
       genre = id3v1item['GENRE'].strip().lower()
+      genreclean = re.sub("[^\w]+", "", genre).strip().lower()
    else:
       genre = "unknown"
+      genreclean = "unknown"
    length = 0.0
 
    try:
@@ -655,42 +696,49 @@ def collect_metadata(abspathitem, db, recentartists, recentalbums, recentgenres,
       album = " ".join(id3item['TALB'].text).strip().lower()
       albumclean = re.sub("[^\w]*", "", album)
       genre = " ".join(id3item['TCON'].text).strip().lower()
+      genreclean = re.sub("[^\w]+", "", genre).strip().lower()
       length = float(id3item['TLEN'])
    except:
       pass
 
    condition.acquire()
+   ar = artist if artist else 'unknown'
    if not artist in recentartists.keys():
-      if not db.execute("select id from artist where name = ?", (artist,)).fetchone():
-         db.execute("insert into artist(name) values(?)", (artist,))
+      if not db.execute("select id from artist where name = ?", (ar,)).fetchone():
+         db.execute("insert into artist(name) values(?)", (ar,))
          db.commit()
-      recentartists[artist] = db.execute("select id from artist where name = ?", (artist,)).fetchone()[0]
+      recentartists[artist] = db.execute("select id from artist where name = ?", (ar,)).fetchone()[0]
    condition.release()
 
    condition.acquire()
+   al = albumclean if albumclean else 'unknown'
    if not album in recentalbums.keys():
-      if not db.execute("select id from album where titleclean = ?", (album,)).fetchone():
+      if not db.execute("select id from album where titleclean = ?", (al,)).fetchone():
          db.execute("insert into album(title, titleclean) values(?, ?)", (album, albumclean))
          db.commit()
-      recentalbums[album] = db.execute("select id from album where titleclean = ?", (albumclean,)).fetchone()[0]
+      recentalbums[album] = db.execute("select id from album where titleclean = ?", (al,)).fetchone()[0]
    condition.release()
 
    condition.acquire()
+   ge = genre if genre else 'unknown'
    if not genre in recentgenres.keys():
-      if not db.execute("select id from genre where desc = ?", (genre,)).fetchone():
-         db.execute("insert into genre(desc) values(?)", (genre,))
+      if not db.execute("select id from genre where desc = ?", (ge,)).fetchone():
+         db.execute("insert into genre(desc, descclean) values(?, ?)", (genre, genreclean))
          db.commit()
-      recentgenres[genre] = db.execute("select id from genre where desc = ?", (genre,)).fetchone()[0]
+      recentgenres[genre] = db.execute("select id from genre where desc = ?", (ge,)).fetchone()[0]
    condition.release()
 
    condition.acquire()
    db.execute("insert or replace into song(title, titleclean, artist_id, genre_id, album_id, path, length) values (?,?,?,?,?,?,?)", (title, titleclean, recentartists[artist], recentgenres[genre], recentalbums[album], abspathitem.decode(FS_ENCODING), length))
-   print "pushing on threads..."
-   md_queue.put((abspathitem, title, artist))
-   fd_queue.put((abspathitem, title, artist))
-   db.commit()
-   condition.release()
-
+   logging.debug("collect_metadata putting new artist on queue")
+   try:
+      md_queue.put((abspathitem, title, artist))
+      fd_queue.put((abspathitem, title, artist))
+   except:
+      pass
+   finally:
+      db.commit()
+      condition.release()
 
 
 def levenshtein(a,b): # Dr. levenshtein, i presume.
@@ -785,21 +833,24 @@ if __name__ == "__main__":
       if prepare:
          for sql in DBSCHEMA:
             db.execute(sql)
-      metadataqueue = Queue()
-      filedataqueue = Queue()
+      metadataqueue = Queue() # deque() #SyncQueue()
+      filedataqueue = Queue() # deque() #SyncQueue()
       condition = threading.Condition()
 
       THREADS.append(MetadataThread(metadataqueue, condition, dbpath))
-      THREADS[-1].start()
       if bpmdetect:
          THREADS.append(FiledataThread(filedataqueue, condition, dbpath))
-         THREADS[-1].start()
 
       if scan:
+         THREADS[-1].start()
+         THREADS[-2].start()
          start_scan(patharg, db, metadataqueue, filedataqueue, condition, recursive)
       if daemon:
          signal.signal(signal.SIGTERM, shutdown)
          try:
+            daemonize()
+            THREADS[-1].start()
+            THREADS[-2].start()
             start_daemon(patharg, dbpath, metadataqueue, filedataqueue, condition)
          except KeyboardInterrupt:
             os.kill(os.getpid(), signal.SIGTERM)
